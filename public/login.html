@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MySQL 登录</title>
+  <link rel="stylesheet" href="/login.css?v=20260421a">
+</head>
+<body class="login-page">
+  <div class="login-noise"></div>
+  <main class="login-shell">
+    <section class="login-stage reveal">
+      <div class="login-stage-copy">
+        <p class="login-eyebrow">DATA REGISTRY STUDIO</p>
+        <h1>数据登记</h1>
+        <p class="login-subtitle">
+          先完成数据库连接，再进入数据留档工作台处理库表浏览、只读查询、自动任务和结果截图。
+        </p>
+        <div class="login-stage-meta">
+          <span>本地运行</span>
+          <span>固定模板</span>
+          <span>自动留档</span>
+        </div>
+      </div>
+
+      <div class="login-feature-list">
+        <article class="login-feature">
+          <span>01</span>
+          <div>
+            <strong>安全边界清晰</strong>
+            <p>连接动作和查询动作分开，页面职责更明确。</p>
+          </div>
+        </article>
+        <article class="login-feature">
+          <span>02</span>
+          <div>
+            <strong>密码不落地</strong>
+            <p>浏览器仅保存 host、port 和 user 草稿，不保存数据库密码。</p>
+          </div>
+        </article>
+        <article class="login-feature">
+          <span>03</span>
+          <div>
+            <strong>连接成功即跳转</strong>
+            <p>登录完成后直接进入工作台，继续后续查询和截图流程。</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="login-card reveal">
+      <div class="login-card-head">
+        <div>
+          <p class="login-eyebrow">Database Login</p>
+          <h2>连接你的 MySQL</h2>
+        </div>
+        <span id="browserStatusBadge" class="login-badge">截图引擎检测中</span>
+      </div>
+
+      <p class="login-note">连接成功后会自动进入工作台页面。</p>
+
+      <div id="existingConnection" class="existing-connection is-hidden">
+        <p>当前已有连接</p>
+        <strong id="existingConnectionText">-</strong>
+        <a id="continueLink" class="login-button login-button-secondary" href="/app">直接进入工作台</a>
+      </div>
+
+      <form id="connectForm" class="login-form">
+        <label>
+          <span>Host</span>
+          <input id="hostInput" name="host" placeholder="127.0.0.1" required>
+        </label>
+        <label>
+          <span>Port</span>
+          <input id="portInput" name="port" type="number" placeholder="3306" required>
+        </label>
+        <label>
+          <span>User</span>
+          <input id="userInput" name="user" placeholder="root" required>
+        </label>
+        <label>
+          <span>Password</span>
+          <input id="passwordInput" name="password" type="password" placeholder="输入数据库密码" required>
+        </label>
+        <button class="login-button login-button-primary" type="submit">连接并进入工作台</button>
+      </form>
+
+      <p id="formMessage" class="form-message">准备就绪。</p>
+    </section>
+  </main>
+
+  <script src="/login.js?v=20260421a" defer></script>
+</body>
+</html>

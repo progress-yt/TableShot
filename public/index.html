@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>数据登记工作台</title>
+  <link rel="stylesheet" href="/styles.css?v=20260421a">
+</head>
+<body>
+  <div class="noise"></div>
+  <div class="app-shell">
+    <header class="workspace-header reveal">
+      <div class="workspace-header-main">
+        <div class="workspace-header-copy">
+          <p class="eyebrow">MYSQL DATA REGISTRY DESK</p>
+          <h1>数据登记工作台</h1>
+          <p class="workspace-subtitle">模板查询·字段识别·抽检预览·批量截图·结果留档</p>
+        </div>
+        <div class="workspace-connection">
+          <span id="connectionBadge" class="status-chip">未连接</span>
+          <p id="connectionMeta">正在读取连接信息...</p>
+        </div>
+      </div>
+
+      <div class="status-icon-row">
+        <button id="statusConnection" class="status-icon-card" type="button" data-tip="当前数据库连接状态">
+          <span class="status-icon-shell">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <ellipse cx="12" cy="5.5" rx="6.5" ry="2.5"></ellipse>
+              <path d="M5.5 5.5v6c0 1.4 2.9 2.5 6.5 2.5s6.5-1.1 6.5-2.5v-6"></path>
+              <path d="M5.5 11.5v6c0 1.4 2.9 2.5 6.5 2.5s6.5-1.1 6.5-2.5v-6"></path>
+            </svg>
+          </span>
+          <span class="status-icon-copy">
+            <strong>连接</strong>
+            <small>数据库状态</small>
+          </span>
+        </button>
+
+        <button id="statusSelection" class="status-icon-card" type="button" data-tip="当前数据库与目标表状态">
+          <span class="status-icon-shell">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="4" y="4" width="16" height="4" rx="1.5"></rect>
+              <rect x="4" y="10" width="16" height="4" rx="1.5"></rect>
+              <rect x="4" y="16" width="10" height="4" rx="1.5"></rect>
+            </svg>
+          </span>
+          <span class="status-icon-copy">
+            <strong>目标表</strong>
+            <small>批量范围</small>
+          </span>
+        </button>
+
+        <button id="statusBrowser" class="status-icon-card" type="button" data-tip="截图浏览器状态">
+          <span class="status-icon-shell">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3.5" y="4.5" width="17" height="13" rx="2"></rect>
+              <path d="M8 19.5h8"></path>
+              <path d="M12 17.5v2"></path>
+            </svg>
+          </span>
+          <span class="status-icon-copy">
+            <strong>截图引擎</strong>
+            <small>浏览器状态</small>
+          </span>
+        </button>
+
+        <button id="statusOutput" class="status-icon-card" type="button" data-tip="尚未生成截图输出">
+          <span class="status-icon-shell">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 4v10"></path>
+              <path d="M8.5 10.5 12 14l3.5-3.5"></path>
+              <rect x="4" y="16" width="16" height="4" rx="1.5"></rect>
+            </svg>
+          </span>
+          <span class="status-icon-copy">
+            <strong>输出记录</strong>
+            <small>PNG 结果</small>
+          </span>
+        </button>
+
+        <a class="status-icon-card is-link" href="/" data-tip="返回登录页并切换数据库连接">
+          <span class="status-icon-shell">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M10 7 5 12l5 5"></path>
+              <path d="M5 12h10"></path>
+              <path d="M14 5h3a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-3"></path>
+            </svg>
+          </span>
+          <span class="status-icon-copy">
+            <strong>切换连接</strong>
+            <small>返回登录页</small>
+          </span>
+        </a>
+      </div>
+      <div class="workspace-brief">
+        <div class="workspace-brief-head">
+          <strong>当前工作区与建议</strong>
+          <p>建议先完成单表抽检，再统一生成批量任务与截图留档，避免重复执行。</p>
+        </div>
+        <div class="workspace-brief-meta">
+          <div class="workspace-brief-item">
+            <span>当前库</span>
+            <strong id="heroDatabaseLabel">未选择数据库</strong>
+          </div>
+          <div class="workspace-brief-item">
+            <span>批量目标</span>
+            <strong id="heroTargetCount">0 张目标表</strong>
+          </div>
+          <div class="workspace-brief-item is-advice">
+            <span>执行提醒</span>
+            <strong>第二步只做抽检，正式留档请在第三步统一执行。</strong>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <div class="workspace-layout">
+      <main class="step-stack">
+        <section id="stepConnect" class="step-panel reveal">
+          <div class="step-panel-head">
+            <div class="step-panel-title">
+              <span class="step-index">01</span>
+              <div>
+                <p class="panel-kicker">Step One</p>
+                <h2>选择数据库与目标表</h2>
+                <p class="step-panel-note">先确定本次处理库，再勾选需要进入批量截图与留档的目标表。</p>
+              </div>
+            </div>
+            <span id="stepConnectState" class="step-state">待完成</span>
+          </div>
+
+          <div class="step-panel-body step-panel-body-compact">
+            <div class="field-grid field-grid-single">
+              <label>
+                <span>数据库</span>
+                <div class="inline-row database-control-row">
+                  <div class="database-select-shell">
+                    <select id="databaseSelect" disabled>
+                      <option value="">请选择数据库</option>
+                    </select>
+                  </div>
+                  <button id="refreshTablesButton" class="icon-action-button refresh-action-button" type="button" data-tip="刷新数据库与目标表" title="刷新数据库与目标表" aria-label="刷新数据库与目标表">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M20 11a8 8 0 1 0 2 5.5"></path>
+                      <path d="M20 4v7h-7"></path>
+                    </svg>
+                  </button>
+                </div>
+                <small class="field-hint">先确定本次要处理的数据库，再勾选本次需要截图的目标表。</small>
+              </label>
+            </div>
+
+            <div class="selection-summary">
+              <span id="selectedTableCountPill" class="summary-pill">0 张目标表</span>
+            </div>
+
+            <div class="task-table-field">
+              <div class="task-table-heading">
+                <span>目标截图表</span>
+                <small class="field-hint">批量任务会对这里勾选的表逐个执行截图。</small>
+              </div>
+              <div id="taskTableChecklist" class="task-table-checklist empty-state">选择数据库后显示可选操作对象。</div>
+            </div>
+
+            <div class="table-toolbar">
+              <button id="selectAllTablesButton" class="chip-button" type="button">全选目标表</button>
+              <button id="clearSelectedTablesButton" class="chip-button" type="button">清空目标表</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="stepQuery" class="step-panel reveal">
+          <div class="step-panel-head">
+            <div class="step-panel-title">
+              <span class="step-index">02</span>
+              <div>
+                <p class="panel-kicker">Step Two</p>
+                <h2>单表试跑与可选预览</h2>
+                <p class="step-panel-note">可选步骤，仅用于抽检当前试跑表；正式批量截图请在步骤三统一执行。</p>
+              </div>
+            </div>
+            <div class="step-head-right">
+              <div class="current-target-meta">
+                <div class="target-meta-pill">
+                  <span>数据库</span>
+                  <strong id="currentDatabaseLabel">未选择</strong>
+                </div>
+                <div class="target-meta-pill target-meta-pill-current">
+                  <span>当前试跑表</span>
+                  <strong id="currentTableLabel">未选择</strong>
+                </div>
+              </div>
+              <span id="stepQueryState" class="step-state">待完成</span>
+            </div>
+          </div>
+
+          <div class="step-panel-body">
+            <div class="field-grid field-grid-compact field-grid-inline">
+              <label>
+                <span>当前试跑表</span>
+                <select id="tableSelect" disabled>
+                  <option value="">请选择要查看的表</option>
+                </select>
+                <small class="field-hint">这里仅决定单表试跑，不影响第一步中已经勾选的批量目标表。</small>
+              </label>
+
+              <label>
+                <span>预览行数</span>
+                <input id="previewLimitInput" type="number" value="30" min="1" max="500">
+                <small class="field-hint">只影响下方可选预览内容。</small>
+              </label>
+            </div>
+
+            <details id="optionalPreviewDisclosure" class="preview-disclosure optional-preview">
+              <summary>
+                <div class="preview-summary-copy">
+                  <strong>展开可选预览</strong>
+                  <small>字段结构与表数据仅用于抽查，不参与正式批量执行。</small>
+                </div>
+                <span class="preview-summary-tag">可选</span>
+              </summary>
+              <div class="preview-stack preview-stack-spacious">
+                <article class="card structure-card">
+                  <div class="card-head">
+                    <div class="card-head-copy">
+                      <h3>字段结构</h3>
+                      <p>优先核对时间字段、区域字段和字段注释，避免模板生成错列。</p>
+                    </div>
+                    <span id="columnsCountLabel" class="badge badge-muted">0 个字段</span>
+                  </div>
+                  <div id="columnsPane" class="data-pane empty-state">选择表后显示字段结构。</div>
+                </article>
+
+                <article class="card data-preview-card">
+                  <div class="card-head">
+                    <div class="card-head-copy">
+                      <h3>表数据预览</h3>
+                      <p>这里只做抽查，确认模板执行结果是否符合预期。</p>
+                    </div>
+                    <span id="previewCountLabel" class="badge badge-muted">0 行</span>
+                  </div>
+                  <details id="previewDisclosure" class="preview-disclosure nested-preview">
+                    <summary>
+                      <div class="preview-summary-copy">
+                        <strong>点击展开表数据预览</strong>
+                        <small id="previewSummaryText">未加载预览数据</small>
+                      </div>
+                      <span class="preview-summary-tag">抽查</span>
+                    </summary>
+                    <div id="previewPane" class="data-pane empty-state">选择表后显示预览数据。</div>
+                  </details>
+                </article>
+              </div>
+            </details>
+
+            <article class="card editor-card">
+              <div class="card-head">
+                <h3>截图模板</h3>
+                <span class="badge badge-outline">只读模板</span>
+              </div>
+              <p class="hint">先选模板，再执行“单表查询”或“单表截图”。这里的截图仅作用于当前试跑表。</p>
+              <div id="sqlTemplateList"></div>
+              <textarea id="sqlEditor" spellcheck="false" readonly></textarea>
+              <div class="action-row">
+                <button id="runQueryButton" class="button button-secondary" type="button">执行当前模板</button>
+                <button id="runAndCaptureButton" class="button button-secondary" type="button">执行并截图（单表）</button>
+              </div>
+            </article>
+
+            <article class="card task-center-card">
+              <div class="card-head">
+                <h3>最近一次查询结果</h3>
+                <span id="resultCountLabel" class="badge badge-muted">0 行</span>
+              </div>
+              <div id="resultPane" class="data-pane empty-state">执行 SQL 后显示结果。</div>
+            </article>
+          </div>
+        </section>
+
+        <section id="stepAutomation" class="step-panel reveal">
+          <div class="step-panel-head">
+            <div class="step-panel-title">
+              <span class="step-index">03</span>
+              <div>
+                <p class="panel-kicker">Step Three</p>
+                <h2>批量截图与留档</h2>
+                <p class="step-panel-note">先生成批量任务，再统一执行截图与结果留档。</p>
+              </div>
+            </div>
+            <span id="stepAutomationState" class="step-state">待完成</span>
+          </div>
+
+          <div class="step-panel-body">
+            <article class="card">
+              <div class="card-head">
+                <div class="card-head-copy">
+                  <h3>任务中心</h3>
+                  <p id="batchRunInfo">请先勾选至少一张目标表，再生成批量任务。</p>
+                </div>
+                <button id="copySelectedSqlButton" class="icon-action-button" type="button" data-tip="复制当前数据库中已选表的模板 SQL" title="复制当前数据库中已选表的模板 SQL" aria-label="复制当前数据库中已选表的模板 SQL">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="9" y="9" width="10" height="10" rx="2"></rect>
+                    <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1"></path>
+                  </svg>
+                </button>
+                <button id="copySelectedSqlButtonNoStructure" class="icon-action-button" type="button" data-tip="复制模板 SQL（不含表结构查询）" title="复制模板 SQL（不含表结构查询）" aria-label="复制模板 SQL（不含表结构查询）">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="9" y="9" width="10" height="10" rx="2"></rect>
+                    <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1"></path>
+                    <line x1="11.5" y1="14" x2="16.5" y2="14" stroke-linecap="round"></line>
+                  </svg>
+                </button>
+              </div>
+              <label>
+                <span>任务模板文件夹</span>
+                <input id="taskNameInput" placeholder="例如：某地方-数据登记">
+              </label>
+              <p class="hint task-center-hint">生成任务时，会按“目标表 × 固定模板”自动展开。需要批量核查时，也可以直接复制已选表的模板 SQL。</p>
+              <div class="action-row compact">
+                <button id="clearTasksButton" class="button button-ghost" type="button">清空任务</button>
+                <button id="saveTaskButton" class="button button-secondary" type="button">生成批量任务</button>
+              </div>
+              <div class="batch-execution-inline">
+                <p>建议先确认任务队列，再统一执行截图。输出会自动按目录结构保存。</p>
+                <button id="runTasksButton" class="button button-primary" type="button">批量执行并截图</button>
+              </div>
+            </article>
+
+            <div class="detail-grid detail-stack">
+              <article class="card">
+                <div class="card-head">
+                  <h3>批量任务队列</h3>
+                  <span id="taskCountLabel" class="badge badge-muted">0 个</span>
+                </div>
+                <div id="tasksPane" class="task-list empty-state">还没有生成具体批量任务。</div>
+              </article>
+
+              <article class="card">
+                <div class="card-head">
+                  <h3>输出记录</h3>
+                  <span id="runFolderBadge" class="badge badge-muted is-hidden"></span>
+                </div>
+                <div id="runSummaryPane" class="run-summary-empty">执行并截图后，这里会显示汇总统计和本次输出目录入口。</div>
+                <div id="runDetailsPane" class="run-details is-hidden"></div>
+              </article>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <aside class="progress-rail reveal" aria-label="步骤跳转">
+        <div class="progress-list">
+          <button id="progressStep1" class="progress-item is-pending" type="button" data-target="stepConnect" aria-label="跳转到步骤 01 选择库表">
+            <span class="progress-dot">01</span>
+            <div class="progress-body">
+              <strong>选库表</strong>
+              <p id="progressText1">等待开始</p>
+            </div>
+          </button>
+
+          <button id="progressStep2" class="progress-item is-pending" type="button" data-target="stepQuery" aria-label="跳转到步骤 02 试跑预览">
+            <span class="progress-dot">02</span>
+            <div class="progress-body">
+              <strong>试跑预览</strong>
+              <p id="progressText2">等待试跑</p>
+            </div>
+          </button>
+
+          <button id="progressStep3" class="progress-item is-pending" type="button" data-target="stepAutomation" aria-label="跳转到步骤 03 批量留档">
+            <span class="progress-dot">03</span>
+            <div class="progress-body">
+              <strong>批量留档</strong>
+              <p id="progressText3">等待执行</p>
+            </div>
+          </button>
+        </div>
+      </aside>
+    </div>
+
+    <div id="batchConfirmModal" class="modal-shell is-hidden" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="card-head">
+          <h3>确认批量截图</h3>
+          <button id="batchModalCloseButton" class="button button-secondary button-small" type="button">关闭</button>
+        </div>
+        <p id="batchModalSummary" class="hint">正在整理本次批量任务...</p>
+        <div class="modal-section">
+          <strong>将要处理的表</strong>
+          <div id="batchModalTables" class="pill-list empty-state">暂无数据</div>
+        </div>
+        <div class="batch-progress">
+          <div class="batch-progress-bar">
+            <div id="batchProgressFill" class="batch-progress-fill"></div>
+          </div>
+          <p id="batchProgressText">尚未开始</p>
+        </div>
+        <div class="action-row modal-actions">
+          <button id="batchModalCancelButton" class="button button-secondary" type="button">取消</button>
+          <button id="batchModalStopButton" class="button button-ghost" type="button">提前结束任务</button>
+          <button id="batchModalConfirmButton" class="button button-primary" type="button">确认执行</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="batchProgressDock" class="batch-progress-dock is-hidden">
+      <button id="batchProgressDockToggle" class="batch-progress-dock-main" type="button">
+        <strong>批量任务执行中</strong>
+        <span id="batchProgressDockText">点击展开查看进度</span>
+      </button>
+      <button id="batchProgressDockStopButton" class="batch-progress-dock-stop" type="button">提前结束</button>
+    </div>
+
+    <footer class="footer reveal">
+      <div id="statusBar">准备就绪。</div>
+    </footer>
+    <div id="toastMessage" class="toast-message" aria-live="polite"></div>
+  </div>
+
+  <script src="/app.js?v=20260421a" defer></script>
+</body>
+</html>
