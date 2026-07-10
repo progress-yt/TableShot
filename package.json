@@ -5,12 +5,19 @@
   "license": "MIT",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node --env-file-if-exists=.env server.js",
+    "check": "node scripts/check-syntax.js",
+    "lint": "eslint .",
+    "test": "node --test --test-concurrency=1",
+    "verify": "npm run check && npm run lint && npm test"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
     "mysql2": "^3.15.2"
+  },
+  "devDependencies": {
+    "eslint": "^10.6.0"
   }
 }

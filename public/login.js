@@ -1,8 +1,10 @@
-const STORAGE_KEY = 'mysql-capture-connection';
+const STORAGE_KEY = 'tableshot:connection-draft:v1';
+const LEGACY_STORAGE_KEY = 'mysql-capture-connection';
 
 const elements = {
   browserStatusBadge: document.getElementById('browserStatusBadge'),
   connectForm: document.getElementById('connectForm'),
+  connectButton: document.getElementById('connectButton'),
   continueLink: document.getElementById('continueLink'),
   existingConnection: document.getElementById('existingConnection'),
   existingConnectionText: document.getElementById('existingConnectionText'),
@@ -12,24 +14,44 @@ const elements = {
   portInput: document.getElementById('portInput'),
   userInput: document.getElementById('userInput')
 };
+let connectLock = false;
 
 function loadConnectionDraft() {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    const current = localStorage.getItem(STORAGE_KEY);
+    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+    const draft = JSON.parse(current || legacy || '{}');
+    if (!current && legacy) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(draft));
+    }
+    localStorage.removeItem(LEGACY_STORAGE_KEY);
+    return draft;
   } catch {
     return {};
   }
 }
 
 function saveConnectionDraft() {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify({
-      host: elements.hostInput.value.trim(),
-      port: elements.portInput.value.trim(),
-      user: elements.userInput.value.trim()
-    })
-  );
+  try {
+    // Only non-secret convenience fields are persisted. Passwords remain memory-only.
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        host: elements.hostInput.value.trim(),
+        port: elements.portInput.value.trim(),
+        user: elements.userInput.value.trim()
+      })
+    );
+  } catch {
+    // Storage may be disabled; connecting should still work.
+  }
+}
+
+function setConnectLock(locked) {
+  connectLock = locked;
+  elements.connectButton.disabled = locked;
+  elements.connectButton.textContent = locked ? '正在连接...' : '连接并进入工作台';
+  elements.connectForm.setAttribute('aria-busy', String(locked));
 }
 
 function setMessage(message, type = 'neutral') {
@@ -72,18 +94,22 @@ async function api(url, options = {}) {
 async function refreshStatus() {
   try {
     const payload = await api('/api/status', { method: 'GET' });
+    if (connectLock) return;
     setBrowserBadge(payload.browser);
     renderExistingConnection(payload.connection);
   } catch (error) {
-    setMessage(error.message, 'error');
+    if (!connectLock) setMessage(error.message, 'error');
   }
 }
 
 async function connectDatabase(event) {
   event.preventDefault();
+  if (connectLock) return;
+  setConnectLock(true);
   saveConnectionDraft();
   setMessage('正在连接数据库...', 'working');
 
+  let connected = false;
   try {
     const payload = await api('/api/connect', {
       method: 'POST',
@@ -98,12 +124,15 @@ async function connectDatabase(event) {
     setBrowserBadge(payload.browser);
     renderExistingConnection(payload.connection);
     setMessage(`连接成功，MySQL 版本 ${payload.version}，正在进入工作台...`, 'success');
+    connected = true;
 
     window.setTimeout(() => {
       window.location.href = '/app';
     }, 240);
   } catch (error) {
     setMessage(error.message, 'error');
+  } finally {
+    if (!connected) setConnectLock(false);
   }
 }
 
@@ -111,7 +140,7 @@ function hydrateDraft() {
   const draft = loadConnectionDraft();
   elements.hostInput.value = draft.host || '127.0.0.1';
   elements.portInput.value = draft.port || '3306';
-  elements.userInput.value = draft.user || 'root';
+  elements.userInput.value = draft.user || '';
 }
 
 function bindEvents() {
@@ -119,6 +148,7 @@ function bindEvents() {
 }
 
 function reveal() {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   document.querySelectorAll('.reveal').forEach((node, index) => {
     node.style.animationDelay = `${index * 100}ms`;
   });

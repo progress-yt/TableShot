@@ -1,258 +1,161 @@
-# MySQL 查询与截图工具
+# TableShot
 
-一个本地运行的 Web 工具，用于连接 MySQL、浏览库表、按固定模板执行查询，并把结果渲染成报告后截图保存到本地。当前实现已适配 Windows、macOS、Linux 三个平台，截图浏览器优先通过环境变量配置，其次按平台常见路径自动发现。
+TableShot 是一个仅在本机 loopback 上运行的 MySQL 查询与截图工作台。它用于浏览有权限访问的库表、执行五种服务端固定模板、预览结果，并通过本机 Edge/Chrome 将结果保存为 PNG 留档。
 
-## 当前状态
+## 安全边界
 
-当前版本的运行形态如下：
+- HTTP 服务只允许绑定数值 loopback 地址 `127.0.0.1` 或 `::1`，不接受可被 DNS/hosts 重定向的 `localhost`，也不能开放到局域网或公网。
+- 浏览器不能提交 SQL。前端只提交 `templateId`、目标库表和经过选择的字段；SQL 由服务端模板注册表生成并通过 prepared statement 执行。
+- 请使用最小权限 MySQL 账号。不要使用 `root` 或带有 `FILE`、DDL、DML 权限的账号。
+- “刷新存储统计”会执行 `ANALYZE TABLE`，不是纯只读操作；界面默认不执行，必须由用户显式确认。
+- 截图、失败日志和临时报告可能包含业务数据，均保存在本机仓库目录下，不应提交到 Git。
 
-- 运行时主代码是 `server.js` 和 `public/` 下的静态页面。
-- 当前前端不是自由 SQL 编辑器，而是 5 个固定查询模板的工作台。
-- 批量任务目前只保存在页面内存中，刷新页面后会丢失。
-- 成功截图输出到 `captures/`，失败日志输出到 `logs/`。
-- 临时 HTML 报告默认只在截图失败时写入 `tmp/`，成功路径不再先写后删。
+## 功能
 
-如果你要继续维护，请先看 [MAINTAINER_GUIDE.md](./MAINTAINER_GUIDE.md)。
-
-## 核心能力
-
-- 连接本机或局域网中的 MySQL
-- 浏览数据库、表、字段结构和表数据预览
-- 对单张表执行固定模板查询
-- 将单表查询结果截图保存到本地
-- 对勾选的多张表生成批量任务并批量截图
-- 一键复制已选表的全部模板 SQL，也可以选择跳过「查询表结构」模板只导出业务查询
-- 为失败任务生成本地日志，便于排查
+- 连接本机或可访问的 MySQL，并可选启用 CA 校验的 MySQL TLS
+- 浏览数据库、表、字段结构和受限数据预览（最多 100 行、64 列；长文本和二进制摘要会在界面明示）
+- 服务端生成并执行五种固定模板：
+  - 查询时间范围
+  - 查询区域分布（最多返回 500 行；每个文本值最多 512 字符，并明确标记截断）
+  - 查询总行数
+  - 查询表结构
+  - 查询存储空间
+- 手动指定时间字段或区域字段；服务端会再次验证字段确实属于目标表
+- 单表查询、单表截图和最多 6 worker 的批量截图
+- 唯一 `runId` 隔离每次运行，防止覆盖历史图片
+- 截图会话预热、复用、超时、容量限制和空闲回收
+- 可复制由服务端返回的规范 SQL
+- 失败日志、内部诊断 HTML、显式结果截断提示
 
 ## 运行要求
 
-- **操作系统**：Windows / macOS / Linux
-- **Node.js**：22+，当前已验证环境为 `v24.14.0`
-  - Node 运行时需要提供全局 `fetch` 和 `WebSocket`（Node 18+ 原生支持，无需 polyfill）
-- **数据库**：可访问的 MySQL 服务
-- **浏览器**：本机安装以下浏览器之一，用于执行截图
-  - Microsoft Edge
-  - Google Chrome
+- Node.js 22 或 24
+- 可访问的 MySQL 服务
+- Microsoft Edge、Google Chrome 或 Chromium
 
-浏览器查找顺序如下：
-
-1. `BROWSER_PATH` 环境变量
-2. 当前平台的常见安装路径
-3. macOS / Linux 上的 `which` 命令回退查找
-
-可选环境变量：
-
-- `HOST`：服务监听地址，默认 `127.0.0.1`
-- `PORT`：服务端口，默认 `3811`
-- `BROWSER_PATH`：显式指定浏览器可执行文件路径
-- `BROWSER_CHANNEL`：当使用 `BROWSER_PATH` 时显示的浏览器名称
-
-## 启动
+安装并启动：
 
 ```bash
 npm install
 npm start
 ```
 
-也可以先复制 `.env.example` 为 `.env` 后按需填写环境变量。
+启动脚本会自动读取存在的 `.env`：
 
-服务默认启动在：
-
-```text
-http://127.0.0.1:3811
-```
-
-如果需要改端口，可以在启动前设置 `PORT`：
-
-```powershell
-$env:PORT='3813'
+```bash
+copy .env.example .env
 npm start
 ```
 
-页面入口：
+默认入口：
 
-- `/`：数据库登录页
-- `/app`：查询工作台
+- 登录页：`http://127.0.0.1:3811/`
+- 工作台：`http://127.0.0.1:3811/app`
+- 纯本地演示：`http://127.0.0.1:3811/app?preview=1`
 
-## 目录说明
+演示模式使用页面内 fixture，所有会访问数据库、截图或打开目录的操作都会被禁用。
 
-- `server.js`
-  后端入口，负责 API 路由、请求处理和静态资源分发。
-- `lib/templates.js`
-  固定模板 SQL 白名单、字段识别、模板可用性判断。
-- `lib/mysql.js`
-  MySQL 连接池与只读查询、库表字段访问。
-- `lib/capture.js`
-  浏览器发现、截图会话、跨平台目录打开和截图产物生成。
-- `public/`
-  前端页面与样式。实际运行入口是 `public/login.html`、`public/index.html`、`public/login.js`、`public/app.js`、`public/login.css`、`public/styles.css`。
-- `captures/`
-  成功生成的 PNG 截图输出目录。
-- `logs/`
-  失败任务的日志目录。
-- `tmp/`
-  失败时保留的临时 HTML 报告目录和运行期临时文件目录。
-## 当前界面流程
+## 环境变量
 
-### 1. 登录页
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `HOST` | `127.0.0.1` | 只能是数值 loopback `127.0.0.1` 或 `::1`；不接受 `localhost` |
+| `PORT` | `3811` | HTTP 端口 |
+| `BROWSER_PATH` | 自动发现 | Edge/Chrome/Chromium 可执行文件 |
+| `BROWSER_CHANNEL` | `ConfiguredBrowser` | 自定义浏览器显示名称 |
+| `MYSQL_QUERY_TIMEOUT_MS` | `15000` | 查询超时，限制在 1–120 秒 |
+| `MYSQL_SSL_CA_PATH` | 空 | MySQL TLS CA 文件路径；配置后启用 TLS |
+| `MYSQL_SSL_REJECT_UNAUTHORIZED` | `true` | 是否校验 MySQL 服务端证书 |
+| `MAX_BROWSER_SESSIONS` | `7` | 浏览器会话数；代码中还有不可突破的硬上限 |
+| `CAPTURE_RETENTION_MS` | `0` | 截图保留时间；`0` 表示不自动删除 |
+| `CAPTURE_TMP_RETENTION_MS` | `86400000` | 失败 HTML、浏览器临时文件保留时间 |
+| `CAPTURE_CLEANUP_INTERVAL_MS` | `3600000` | 截图/临时目录清理检查间隔 |
+| `LOG_RETENTION_MS` | `0` | 内部失败日志内容保留时间；正数会清空过期内容并保留受限文件槽，`0` 表示不自动清空 |
 
-- 页面只保存 `host / port / user` 草稿到浏览器本地存储
-- 数据库密码不会写入本地存储
-- 连接成功后跳转到 `/app`
+自动清理是破坏性行为，因此截图和日志默认永久保留。截图只有在显式配置 `CAPTURE_RETENTION_MS` 后才会删除；内部失败日志只有在显式配置 `LOG_RETENTION_MS` 后才会清空过期内容。清空后的内部日志槽不会跨路径删除，可由后续失败安全复用。
 
-### 2. 查询工作台
+## 工作流
 
-工作台分 3 步：
+1. 使用最小权限账号连接 MySQL。
+2. 选择数据库和目标表。
+3. 选择试跑表，查看字段及分页预览。
+4. 选择模板；前端向 `/api/query/preview` 请求服务端规范 SQL。
+5. 执行查询或截图。
+6. 勾选多个表生成“表 × 模板”任务，并批量运行。
 
-1. 选择数据库与目标表
-2. 对当前试跑表做字段预览、数据预览、单表查询或单表截图
-3. 生成批量任务并统一执行截图
+存储空间模板会显示可选的统计刷新开关。未勾选时只读取现有 `information_schema` 统计；勾选后才调用带 `confirm: true` 的 `/api/analyze-table`。
 
-### 3. 固定模板
+## 输出
 
-当前固定模板共 5 个：
-
-- `查询时间范围`
-- `查询区域分布`
-- `查询总行数`
-- `查询表结构`
-- `查询存储空间`
-
-说明：
-
-- 前端 SQL 文本框是只读预览，不支持直接输入任意 SQL。
-- 模板 SQL 由前端根据当前表动态生成。
-- 服务端会对模板 SQL 再做白名单校验。
-- 服务端静态文件访问和目录打开都限制在受控根目录内，避免路径穿越到工作区外。
-- `查询存储空间` 执行前，系统会对相关表自动执行一次 `ANALYZE TABLE`，以确保 `information_schema.TABLES.data_length` 是最新值。这是隐式写入（更新统计信息），工具不是绝对零写入的数据库工具。其他 4 个模板不会触发 ANALYZE。
-
-## 输出规则
-
-单表或批量截图成功后，图片会写入：
+截图路径：
 
 ```text
-captures/<任务文件夹名>/<表名>/<固定图片名>.png
+captures/<runId>/<任务名>/<表名>/<固定图片名>.png
 ```
 
-当前固定图片名规则：
+服务端返回本次运行根目录 `captures/<runId>`，前端不会自行拼接磁盘路径。相同运行内不允许覆盖同名图片，PNG 通过临时文件原子发布。截图不会通过 HTTP 暴露；请使用界面的“打开目录”查看。
 
-- `记录时间`
-- `表空间`
-- `表行数`
-- `区域数据`
-- `表结构`
+- `captures/`：PNG 产物
+- `logs/`：失败日志
+- `tmp/capture-failures/`：截图失败时保留的内部 HTML
+- `tmp/browser-profile/`：隔离的浏览器 profile
 
-任务失败时：
+查询结果和截图行数有独立上限。界面、产物元数据和报告 HTML 会分别说明“查询结果达到上限”和“截图只包含前 N 行”。
 
-- 日志写入 `logs/<时间戳>-<任务名>.log`
-- 对应的临时 HTML 报告会保留在 `tmp/`
+内部失败日志受文件数、单文件和总字节预算限制；截图失败诊断 HTML 最多保留 50 个、总计最多 8 MiB。类 Unix 系统上的新日志、PNG 和诊断 HTML 使用 `0600` 权限。
 
-## 截图实现说明
+## API 概览
 
-- 截图通过本机可用的 Chromium 内核浏览器完成。
-- 成功路径直接使用内存中的 HTML 字符串截图，失败时才保留临时 HTML 到 `tmp/`。
-- 浏览器预热和会话复用已内置在后端服务中，调用方不需要感知平台差异。
-
-## 状态持久化
-
-当前状态分为两类：
-
-- 服务端内存状态
-  - 当前数据库连接配置
-  - 当前 MySQL 连接池
-- 浏览器本地存储
-  - 登录页：`host / port / user`
-  - 工作台：当前模板 ID、当前生成的 SQL 预览
-
-当前不会持久化的内容：
-
-- 批量任务列表
-- 单表查询结果
-- 预览数据
-- 数据库密码
-
-## API 简表
-
-当前主要接口如下：
-
-- `GET /api/status`
-  返回当前是否已连接数据库、截图浏览器是否可用、当前连接元信息。
-- `POST /api/connect`
-  建立数据库连接并初始化连接池。
+- `GET /api/status`：连接健康状态与浏览器可用性
+- `GET /api/templates`：公共模板元数据，不包含执行函数
+- `POST /api/connect`：原子验证并替换 MySQL 连接池
 - `GET /api/databases`
-  列出数据库。
 - `GET /api/tables?database=<db>`
-  列出表和模板可用性。
 - `GET /api/columns?database=<db>&table=<table>`
-  列出字段结构。
 - `GET /api/preview?database=<db>&table=<table>&limit=<n>`
-  预览表数据。
-- `POST /api/query`
-  执行单个模板查询，可选截图。
-- `POST /api/analyze-table`
-  对指定表执行 `ANALYZE TABLE` 刷新统计信息。不生成截图，失败时写入 `logs/`。前端在执行 `查询存储空间` 前会自动调用。
-- `POST /api/automation/run`
-  保留的批量接口，目前前端主流程不依赖它。
+- `POST /api/query/preview`：生成规范 SQL，不执行模板查询
+- `POST /api/query`：执行结构化模板，可选截图
+- `POST /api/analyze-table`：要求 `confirm: true`
+- `POST /api/capture/warmup`：受数量、格式和并发限制的预热
+- `POST /api/open-folder`：只允许 `captures/`、`logs/`、`tmp/` 下的目录
 
-注意：
+旧的 `/api/automation/run` 已停用并返回 `410 Gone`。批量执行统一为前端受限 worker 调用结构化 `/api/query`。
 
-- `/api/query` 当前只接受固定模板形状的 SQL，不接受任意只读 SQL。`ANALYZE TABLE` 已从模板白名单剥离，必须走 `/api/analyze-table`。
-- `assertReadOnlySql()` 仍然存在于后端，但当前 UI 主流程没有开放自由 SQL 编辑入口。
+示例查询请求：
 
-## 开源化建议
+```json
+{
+  "database": "analytics",
+  "table": "orders",
+  "templateId": "time-range",
+  "fields": { "timeField": "created_at" },
+  "capture": true,
+  "taskName": "daily-report",
+  "runId": "72a26b32-7fee-4e70-a7ef-fd95b4eb279e",
+  "captureProfileKey": "single-run-preview"
+}
+```
 
-如果要把项目正式作为开源仓库发布，至少还应补齐这些内容：
+请求中出现 `sql` 会被拒绝。所有 POST API 只接受 `Content-Type: application/json`。
 
-- 明确 LICENSE、维护者、仓库地址和 issue 渠道
-- 增加 `CONTRIBUTING.md`、`SECURITY.md`、`CHANGELOG.md`
-- 清理示例截图、日志、临时文件，避免把业务数据带入仓库
-- 增加最小自动化校验，例如 `node --check` 和关键 API smoke test
+## 开发与验证
 
-## 已知限制
+```bash
+npm run check
+npm run lint
+npm test
+npm run verify
+```
 
-- **单用户架构**：当前后端是单进程、单全局连接状态，不适合多用户同时使用。
-- **截图依赖本机浏览器**：运行截图功能的机器必须安装受支持的浏览器，或显式配置 `BROWSER_PATH`。
-- **没有自动化测试**：没有自动化测试、没有 lint、没有类型系统。
+- 测试使用 Node 内置 test runner，不需要真实 MySQL 或浏览器。
+- CI 在 Node 22 和 24 上执行完整 `verify`。
+- 真实 MySQL/浏览器 smoke test 仍应在发布机器上使用非敏感测试库执行。
 
-## 移植到其他环境的注意事项
+维护者请继续阅读 [MAINTAINER_GUIDE.md](./MAINTAINER_GUIDE.md)、[CONTEXT.md](./CONTEXT.md) 和 `docs/adr/`。
 
-如果你打算将本项目复制到其他环境运行，请注意以下几点：
+## 明确限制
 
-### 1. 跨平台浏览器配置
-
-优先通过 `BROWSER_PATH` 指定浏览器可执行文件路径；未设置时，程序会按平台常见路径自动查找。
-
-### 2. Node.js 版本要求
-
-确保目标环境的 Node.js 版本满足以下任一条件：
-- Node.js 18+：原生支持全局 `fetch` 和 `WebSocket`，可直接运行
-- Node.js 16 或更低版本：需要自行引入 polyfill
-
-### 3. 目录权限
-
-确保运行环境对以下目录有读写权限：
-- `captures/` - 截图输出
-- `logs/` - 失败日志
-- `tmp/` - 临时文件
-
-### 4. 网络访问
-
-- 服务端默认监听 `127.0.0.1:3811`，如需允许局域网访问，请通过环境变量 `HOST` 调整
-- 确保目标环境可以访问 MySQL 服务
-
-### 5. 架构限制
-
-本项目定位为"本机使用的内部工具原型"，不适合以下场景：
-- 多用户并发访问
-- 公网部署
-- 需要持久化任务记录的场景
-
-## 维护入口
-
-继续开发前，建议按这个顺序阅读：
-
-1. [MAINTAINER_GUIDE.md](./MAINTAINER_GUIDE.md)
-2. `server.js`
-3. `public/app.js`
-4. `public/index.html`
-5. `public/login.js`
+- 单进程、单用户、本机工具，不是多用户服务。
+- 数据库连接与任务队列只保存在内存中，重启或刷新后需要重新建立。
+- 浏览器必须安装在运行服务的同一台机器上。
+- 大表模板仍可能消耗数据库资源，因此有查询超时、结果上限和有限连接队列。

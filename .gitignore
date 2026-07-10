@@ -3,4 +3,7 @@ captures/
 logs/
 tmp/
 .env
+coverage/
+*.key
+*.pem
 

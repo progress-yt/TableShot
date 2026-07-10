@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>数据登记工作台</title>
-  <link rel="stylesheet" href="/styles.css?v=20260421a">
+  <link rel="stylesheet" href="/styles.css?v=20260710a">
 </head>
 <body>
   <div class="noise"></div>
@@ -23,7 +23,7 @@
       </div>
 
       <div class="status-icon-row">
-        <button id="statusConnection" class="status-icon-card" type="button" data-tip="当前数据库连接状态">
+        <div id="statusConnection" class="status-icon-card" role="status" data-tip="当前数据库连接状态">
           <span class="status-icon-shell">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <ellipse cx="12" cy="5.5" rx="6.5" ry="2.5"></ellipse>
@@ -35,9 +35,9 @@
             <strong>连接</strong>
             <small>数据库状态</small>
           </span>
-        </button>
+        </div>
 
-        <button id="statusSelection" class="status-icon-card" type="button" data-tip="当前数据库与目标表状态">
+        <div id="statusSelection" class="status-icon-card" role="status" data-tip="当前数据库与目标表状态">
           <span class="status-icon-shell">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <rect x="4" y="4" width="16" height="4" rx="1.5"></rect>
@@ -49,9 +49,9 @@
             <strong>目标表</strong>
             <small>批量范围</small>
           </span>
-        </button>
+        </div>
 
-        <button id="statusBrowser" class="status-icon-card" type="button" data-tip="截图浏览器状态">
+        <div id="statusBrowser" class="status-icon-card" role="status" data-tip="截图浏览器状态">
           <span class="status-icon-shell">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <rect x="3.5" y="4.5" width="17" height="13" rx="2"></rect>
@@ -63,9 +63,9 @@
             <strong>截图引擎</strong>
             <small>浏览器状态</small>
           </span>
-        </button>
+        </div>
 
-        <button id="statusOutput" class="status-icon-card" type="button" data-tip="尚未生成截图输出">
+        <div id="statusOutput" class="status-icon-card" role="status" data-tip="尚未生成截图输出">
           <span class="status-icon-shell">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 4v10"></path>
@@ -77,7 +77,7 @@
             <strong>输出记录</strong>
             <small>PNG 结果</small>
           </span>
-        </button>
+        </div>
 
         <a class="status-icon-card is-link" href="/" data-tip="返回登录页并切换数据库连接">
           <span class="status-icon-shell">
@@ -207,7 +207,7 @@
 
               <label>
                 <span>预览行数</span>
-                <input id="previewLimitInput" type="number" value="30" min="1" max="500">
+                <input id="previewLimitInput" type="number" value="30" min="1" max="100">
                 <small class="field-hint">只影响下方可选预览内容。</small>
               </label>
             </div>
@@ -261,7 +261,7 @@
               </div>
               <p class="hint">先选模板，再执行“单表查询”或“单表截图”。这里的截图仅作用于当前试跑表。</p>
               <div id="sqlTemplateList"></div>
-              <textarea id="sqlEditor" spellcheck="false" readonly></textarea>
+              <textarea id="sqlEditor" spellcheck="false" readonly aria-label="服务端生成的规范 SQL"></textarea>
               <div class="action-row">
                 <button id="runQueryButton" class="button button-secondary" type="button">执行当前模板</button>
                 <button id="runAndCaptureButton" class="button button-secondary" type="button">执行并截图（单表）</button>
@@ -298,17 +298,10 @@
                   <h3>任务中心</h3>
                   <p id="batchRunInfo">请先勾选至少一张目标表，再生成批量任务。</p>
                 </div>
-                <button id="copySelectedSqlButton" class="icon-action-button" type="button" data-tip="复制当前数据库中已选表的模板 SQL" title="复制当前数据库中已选表的模板 SQL" aria-label="复制当前数据库中已选表的模板 SQL">
+                <button id="copySelectedSqlButton" class="icon-action-button" type="button" data-tip="执行模板后可复制服务端返回的规范 SQL" title="执行模板后可复制服务端返回的规范 SQL" aria-label="复制最近一次服务端返回的规范 SQL" disabled>
                   <svg viewBox="0 0 24 24" aria-hidden="true">
                     <rect x="9" y="9" width="10" height="10" rx="2"></rect>
                     <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1"></path>
-                  </svg>
-                </button>
-                <button id="copySelectedSqlButtonNoStructure" class="icon-action-button" type="button" data-tip="复制模板 SQL（不含表结构查询）" title="复制模板 SQL（不含表结构查询）" aria-label="复制模板 SQL（不含表结构查询）">
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <rect x="9" y="9" width="10" height="10" rx="2"></rect>
-                    <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1"></path>
-                    <line x1="11.5" y1="14" x2="16.5" y2="14" stroke-linecap="round"></line>
                   </svg>
                 </button>
               </div>
@@ -316,7 +309,7 @@
                 <span>任务模板文件夹</span>
                 <input id="taskNameInput" placeholder="例如：某地方-数据登记">
               </label>
-              <p class="hint task-center-hint">生成任务时，会按“目标表 × 固定模板”自动展开。需要批量核查时，也可以直接复制已选表的模板 SQL。</p>
+              <p class="hint task-center-hint">生成任务时，会按“目标表 × 固定模板”自动展开。任务队列仅保留在当前页面会话中；SQL 由服务端在执行时生成。</p>
               <div class="action-row compact">
                 <button id="clearTasksButton" class="button button-ghost" type="button">清空任务</button>
                 <button id="saveTaskButton" class="button button-secondary" type="button">生成批量任务</button>
@@ -378,11 +371,11 @@
       </aside>
     </div>
 
-    <div id="batchConfirmModal" class="modal-shell is-hidden" aria-hidden="true">
-      <div class="modal-backdrop"></div>
-      <div class="modal-card">
+    <div id="batchConfirmModal" class="modal-shell is-hidden" role="dialog" aria-modal="true" aria-labelledby="batchModalTitle" aria-hidden="true" tabindex="-1">
+      <div class="modal-backdrop" aria-hidden="true"></div>
+      <div class="modal-card" tabindex="-1">
         <div class="card-head">
-          <h3>确认批量截图</h3>
+          <h3 id="batchModalTitle">确认批量截图</h3>
           <button id="batchModalCloseButton" class="button button-secondary button-small" type="button">关闭</button>
         </div>
         <p id="batchModalSummary" class="hint">正在整理本次批量任务...</p>
@@ -390,11 +383,15 @@
           <strong>将要处理的表</strong>
           <div id="batchModalTables" class="pill-list empty-state">暂无数据</div>
         </div>
+        <label id="batchAnalyzeOption" class="batch-analyze-option is-hidden">
+          <input id="analyzeBeforeRunCheckbox" type="checkbox">
+          <span>执行存储空间模板前刷新表统计信息（会执行 ANALYZE TABLE）</span>
+        </label>
         <div class="batch-progress">
-          <div class="batch-progress-bar">
+          <div id="batchProgressBar" class="batch-progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-labelledby="batchProgressText">
             <div id="batchProgressFill" class="batch-progress-fill"></div>
           </div>
-          <p id="batchProgressText">尚未开始</p>
+          <p id="batchProgressText" aria-live="polite" aria-atomic="true">尚未开始</p>
         </div>
         <div class="action-row modal-actions">
           <button id="batchModalCancelButton" class="button button-secondary" type="button">取消</button>
@@ -404,7 +401,7 @@
       </div>
     </div>
 
-    <div id="batchProgressDock" class="batch-progress-dock is-hidden">
+    <div id="batchProgressDock" class="batch-progress-dock is-hidden" role="status" aria-live="polite">
       <button id="batchProgressDockToggle" class="batch-progress-dock-main" type="button">
         <strong>批量任务执行中</strong>
         <span id="batchProgressDockText">点击展开查看进度</span>
@@ -413,11 +410,12 @@
     </div>
 
     <footer class="footer reveal">
-      <div id="statusBar">准备就绪。</div>
+      <div id="statusBar" role="status" aria-live="polite" aria-atomic="true">准备就绪。</div>
     </footer>
     <div id="toastMessage" class="toast-message" aria-live="polite"></div>
   </div>
 
-  <script src="/app.js?v=20260421a" defer></script>
+  <script src="/app-core.js?v=20260710a" defer></script>
+  <script src="/app.js?v=20260710a" defer></script>
 </body>
 </html>

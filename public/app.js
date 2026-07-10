@@ -1,9 +1,27 @@
 ﻿const STORAGE_KEYS = {
-  tasks: 'mysql-capture-tasks',
-  sql: 'mysql-capture-sql',
-  templateId: 'mysql-capture-template-id',
-  fieldOverrides: 'mysql-capture-field-overrides'
+  preferences: 'tableshot:preferences:v1'
 };
+const LEGACY_STORAGE_KEYS = [
+  'mysql-capture-tasks',
+  'mysql-capture-sql',
+  'mysql-capture-template-id',
+  'mysql-capture-field-overrides'
+];
+
+const {
+  buildQueryRequest,
+  createRequestCoordinator,
+  createRunId,
+  createRunLedger,
+  createRunLock,
+  describeCaptureCompleteness,
+  describePreviewCompleteness,
+  describeQueryCompleteness,
+  isAbortError,
+  mapWithConcurrency,
+  paginate,
+  requireCaptureArtifact
+} = window.TableShotCore;
 
 const TIME_FIELD_CANDIDATES = [
   'created_time',
@@ -50,16 +68,27 @@ const REGION_FIELD_NAME_PATTERN = /(^|_)(region|area|district|zone|province|city
 const REGION_FIELD_COMMENT_PATTERN = /(区域|地区|省|市|县|区|镇|乡|街道|村|社区)/;
 const REGION_FIELD_EXCLUDE_PATTERN = /(^|_)(id|hash|md5|sha1|sha256|uuid|guid|token|salt|pwd|password|create|created|update|updated|delete|deleted|time|date)(_|$)/;
 
-const QUERY_TEMPLATES = [
-  { id: 'time-range', name: '查询时间范围', description: '自动识别时间字段并返回最早与最晚日期' },
-  { id: 'region-distribution', name: '查询区域分布', description: '自动识别区域字段并列出区域值' },
-  { id: 'total-rows', name: '查询总行数', description: '统计当前表总行数，并显示表名称' },
-  { id: 'table-structure', name: '查询表结构', description: '查看当前表的字段、类型、默认值和注释' },
-  { id: 'storage-usage', name: '查询存储空间', description: '查看当前表的存储空间占用（执行前会自动刷新统计信息）' }
+const FALLBACK_TEMPLATE_METADATA = [
+  { id: 'time-range', name: '查询时间范围', description: '自动识别时间字段并返回最早与最晚日期', fieldRole: 'timeField', sideEffects: [] },
+  { id: 'region-distribution', name: '查询区域分布', description: '自动识别区域字段并列出区域值', fieldRole: 'regionField', sideEffects: [] },
+  { id: 'total-rows', name: '查询总行数', description: '统计当前表总行数，并显示表名称', fieldRole: null, sideEffects: [] },
+  { id: 'table-structure', name: '查询表结构', description: '查看当前表的字段、类型、默认值和注释', fieldRole: null, sideEffects: [] },
+  { id: 'storage-usage', name: '查询存储空间', description: '读取当前表的存储空间统计；刷新统计信息需用户另行确认', fieldRole: null, sideEffects: ['analyze-table'] }
 ];
+let QUERY_TEMPLATES = [];
 
-const DEFAULT_SQL = '-- 请先选择一张表';
+const DEFAULT_SQL = '-- 请选择数据库、表和模板；规范 SQL 将由服务端生成';
 const BATCH_CONCURRENCY_HARD_CAP = 6;
+const RESULT_PAGE_SIZE = 100;
+const RUN_ENTRY_PAGE_SIZE = 50;
+const TASK_GROUP_PAGE_SIZE = 20;
+const TASK_STATUS_LABELS = {
+  queued: '等待执行',
+  running: '执行中',
+  succeeded: '已成功',
+  failed: '已失败',
+  cancelled: '已取消'
+};
 
 function getBatchConcurrency(taskCount) {
   const cores = Number(navigator.hardwareConcurrency) || 4;
@@ -68,6 +97,9 @@ function getBatchConcurrency(taskCount) {
   return Math.max(1, Math.min(Number(taskCount) || 0, upper));
 }
 const PREVIEW_MODE = new URLSearchParams(window.location.search).has('preview');
+const selectionRequests = createRequestCoordinator();
+const singleRunLock = createRunLock();
+const batchRunLock = createRunLock();
 
 const state = {
   batchAbortControllers: new Set(),
@@ -79,21 +111,29 @@ const state = {
   batchStartedAt: 0,
   batchTasksOverride: null,
   batchRunning: false,
+  batchLedger: null,
   batchTotal: 0,
   columns: [],
   connection: null,
   currentDatabase: '',
   currentTable: '',
-  currentTemplateId: QUERY_TEMPLATES[0].id,
+  currentTemplateId: '',
   databases: [],
   fieldOverrides: {},
+  lastServerSql: null,
   preview: { columns: [], rows: [] },
+  previewPage: 1,
   result: { columns: [], rows: [] },
+  resultPage: 1,
   runContext: null,
   runEntries: [],
-  runStats: { success: 0, warning: 0, failure: 0, total: 0, durationMs: 0, tables: new Set() },
+  runEntriesByKind: { success: [], warning: [], failure: [], cancelled: [] },
+  runPages: { success: 1, warning: 1, failure: 1, cancelled: 1 },
+  runStats: { success: 0, warning: 0, failure: 0, cancelled: 0, total: 0, durationMs: 0, tables: new Set() },
   selectedTables: new Set(),
+  taskPage: 1,
   tables: [],
+  templatesReady: false,
   tasks: []
 };
 
@@ -112,6 +152,9 @@ const elements = {
   batchProgressDockText: document.getElementById('batchProgressDockText'),
   batchModalSummary: document.getElementById('batchModalSummary'),
   batchModalTables: document.getElementById('batchModalTables'),
+  batchAnalyzeOption: document.getElementById('batchAnalyzeOption'),
+  analyzeBeforeRunCheckbox: document.getElementById('analyzeBeforeRunCheckbox'),
+  batchProgressBar: document.getElementById('batchProgressBar'),
   batchProgressFill: document.getElementById('batchProgressFill'),
   batchProgressText: document.getElementById('batchProgressText'),
   batchRunInfo: document.getElementById('batchRunInfo'),
@@ -177,8 +220,15 @@ let templateFieldLabel = null;
 let templateFieldSelect = null;
 let templateFieldHint = null;
 let toastTimer = null;
+let modalReturnFocus = null;
+let runRenderScheduled = false;
+let taskRenderScheduled = false;
+const taskStatusNodes = new Map();
 
 function api(url, options = {}) {
+  if (PREVIEW_MODE) {
+    throw new Error('预览模式禁止访问真实 API。');
+  }
   return fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options }).then(async (response) => {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload.ok === false) {
@@ -198,6 +248,9 @@ async function retryRequest(fn, attempts = 2, delayMs = 350) {
       return await fn();
     } catch (error) {
       lastError = error;
+      if (isAbortError(error)) {
+        throw error;
+      }
       if (index === attempts - 1) {
         break;
       }
@@ -209,7 +262,9 @@ async function retryRequest(fn, attempts = 2, delayMs = 350) {
 }
 
 function getTemplateById(templateId) {
-  return QUERY_TEMPLATES.find((item) => item.id === templateId) || QUERY_TEMPLATES[0];
+  return QUERY_TEMPLATES.find((item) => item.id === templateId)
+    || QUERY_TEMPLATES[0]
+    || { id: '', name: '模板未加载', description: '', fieldRole: null, sideEffects: [] };
 }
 
 function getTableInfo(tableName = state.currentTable) {
@@ -228,8 +283,19 @@ function getFieldOverrides(tableName, database = state.currentDatabase) {
   return state.fieldOverrides[getFieldOverrideKey(tableName, database)] || {};
 }
 
-function persistFieldOverrides() {
-  localStorage.setItem(STORAGE_KEYS.fieldOverrides, JSON.stringify(state.fieldOverrides));
+function templateRequiresAnalyze(templateId) {
+  return getTemplateById(templateId).sideEffects.includes('analyze-table');
+}
+
+function persistPreferences() {
+  try {
+    localStorage.setItem(STORAGE_KEYS.preferences, JSON.stringify({
+      templateId: state.currentTemplateId,
+      fieldOverrides: state.fieldOverrides
+    }));
+  } catch {
+    // Preferences are optional; a blocked storage area must not block the workflow.
+  }
 }
 
 function setFieldOverride(tableName, role, value, database = state.currentDatabase) {
@@ -246,7 +312,7 @@ function setFieldOverride(tableName, role, value, database = state.currentDataba
       delete state.fieldOverrides[key];
     }
   }
-  persistFieldOverrides();
+  persistPreferences();
 }
 
 function dedupeFieldNames(names) {
@@ -303,10 +369,11 @@ function buildFieldCandidates(columns) {
 }
 
 function getTemplateFieldRequirement(templateId) {
-  if (templateId === 'time-range') {
+  const fieldRole = getTemplateById(templateId)?.fieldRole;
+  if (fieldRole === 'timeField') {
     return { role: 'timeField', label: '时间字段', candidateKey: 'timeFields' };
   }
-  if (templateId === 'region-distribution') {
+  if (fieldRole === 'regionField') {
     return { role: 'regionField', label: '区域字段', candidateKey: 'regionFields' };
   }
   return null;
@@ -444,74 +511,129 @@ function resolveTemplateContext(templateId, tableName = state.currentTable) {
   };
 }
 
-function escapeIdentifier(value) {
-  return `\`${String(value).replace(/`/g, '``')}\``;
-}
-
-function escapeLiteral(value) {
-  return `'${String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
-}
-
-function buildTemplateSql(templateId, database, tableName, tableComment = '') {
-  if (!database || !tableName) return DEFAULT_SQL;
-  const targetTable = `${escapeIdentifier(tableName)}`;
-  const label = tableComment && String(tableComment).trim() ? String(tableComment).trim() : tableName;
+function getQueryFields(templateId, tableName = state.currentTable) {
   const context = resolveTemplateContext(templateId, tableName);
-  switch (templateId) {
-    case 'time-range':
-      if (!context.timeField) {
-        return context.fieldState?.candidates?.length
-          ? '-- 当前模板未自动识别到时间字段，请先从上方候选字段中手动选择'
-          : '-- 当前表未检测到可用时间字段';
-      }
-      return ['SELECT',`    DATE(MIN(${escapeIdentifier(context.timeField)})) AS earliest_record,`,`    DATE(MAX(${escapeIdentifier(context.timeField)})) AS latest_record`,`FROM ${targetTable};`].join('\n');
-    case 'region-distribution':
-      if (!context.regionField) {
-        return context.fieldState?.candidates?.length
-          ? '-- 当前模板未自动识别到区域字段，请先从上方候选字段中手动选择'
-          : '-- 当前表未检测到可用区域字段';
-      }
-      return [`SELECT DISTINCT ${escapeIdentifier(context.regionField)}`,`FROM ${targetTable};`].join('\n');
-    case 'total-rows':
-      return ['SELECT',`    ${escapeLiteral(label)} AS 表名称,`,'    COUNT(1) AS 总行数',`FROM ${targetTable};`].join('\n');
-    case 'table-structure':
-      return [
-        'SELECT',
-        '    ORDINAL_POSITION AS 序号,',
-        '    COLUMN_NAME AS 字段名,',
-        '    COLUMN_TYPE AS 类型,',
-        "    CASE WHEN IS_NULLABLE = 'YES' THEN '是' ELSE '否' END AS 可空,",
-        "    COALESCE(COLUMN_DEFAULT, 'NULL') AS 默认值,",
-        "    COALESCE(NULLIF(COLUMN_COMMENT, ''), '暂无字段注释') AS 注释",
-        'FROM information_schema.COLUMNS',
-        'WHERE TABLE_SCHEMA = DATABASE()',
-        `  AND TABLE_NAME = ${escapeLiteral(tableName)}`,
-        'ORDER BY ORDINAL_POSITION;'
-      ].join('\n');
-    case 'storage-usage':
-      return [
-        'SELECT',
-        '    CONCAT(',
-        `        ${escapeLiteral(`${label}当前占用 `)},`,
-        '        ROUND(SUM(data_length + index_length) / 1024 / 1024, 2),',
-        "        'MB 存储空间'",
-        '    ) AS table_description',
-        'FROM information_schema.TABLES',
-        'WHERE table_schema = DATABASE()',
-        `  AND table_name = ${escapeLiteral(tableName)};`
-      ].join('\n');
-    default:
-      return DEFAULT_SQL;
+  return {
+    timeField: context.timeField || '',
+    regionField: context.regionField || ''
+  };
+}
+
+function getQueryPreviewKey(database, table, templateId, fields) {
+  return JSON.stringify([database, table, templateId, fields?.timeField || '', fields?.regionField || '']);
+}
+
+function getPreviewQueryFixture({ database, table, templateId, fields }) {
+  const template = getTemplateById(templateId);
+  const fieldText = fields.timeField || fields.regionField
+    ? `；字段 ${fields.timeField || fields.regionField}`
+    : '';
+  return {
+    ok: true,
+    sql: `-- 预览模式固定响应：${database}.${table} / ${template.name}${fieldText}`,
+    template
+  };
+}
+
+async function requestQueryPreview(input, signal) {
+  if (PREVIEW_MODE) {
+    return getPreviewQueryFixture(input);
+  }
+  return api('/api/query/preview', {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({
+      database: input.database,
+      table: input.table,
+      templateId: input.templateId,
+      fields: input.fields
+    })
+  });
+}
+
+async function loadTemplateMetadata() {
+  if (PREVIEW_MODE) {
+    QUERY_TEMPLATES = FALLBACK_TEMPLATE_METADATA.map((template) => ({ ...template }));
+    state.templatesReady = true;
+    if (!QUERY_TEMPLATES.some((template) => template.id === state.currentTemplateId)) {
+      state.currentTemplateId = QUERY_TEMPLATES[0].id;
+    }
+    return;
+  }
+  const payload = await api('/api/templates', { method: 'GET' });
+  const templates = Array.isArray(payload.templates) ? payload.templates : [];
+  const normalized = templates
+    .filter((template) => template && typeof template.id === 'string' && typeof template.name === 'string')
+    .map((template) => ({
+      id: template.id,
+      name: template.name,
+      description: String(template.description || ''),
+      fieldRole: template.fieldRole === 'timeField' || template.fieldRole === 'regionField' ? template.fieldRole : null,
+      sideEffects: Array.isArray(template.sideEffects)
+        ? template.sideEffects.filter((sideEffect) => typeof sideEffect === 'string')
+        : []
+    }));
+  if (!normalized.length) {
+    throw new Error('服务端未返回可用模板，查询与截图功能已停用。');
+  }
+  QUERY_TEMPLATES = normalized;
+  state.templatesReady = true;
+  if (!QUERY_TEMPLATES.some((template) => template.id === state.currentTemplateId)) {
+    state.currentTemplateId = QUERY_TEMPLATES[0].id;
   }
 }
 
-function updateSqlPreview() {
-  const tableInfo = getTableInfo();
-  elements.sqlEditor.value = buildTemplateSql(state.currentTemplateId, state.currentDatabase, tableInfo?.tableName || '', tableInfo?.tableComment || '');
-  localStorage.setItem(STORAGE_KEYS.templateId, state.currentTemplateId);
-  localStorage.setItem(STORAGE_KEYS.sql, elements.sqlEditor.value);
+async function updateSqlPreview() {
+  persistPreferences();
+  if (!state.templatesReady) {
+    selectionRequests.abort('template-preview');
+    elements.sqlEditor.value = '-- 正在等待服务端模板元数据；查询功能暂不可用';
+    return;
+  }
   renderTemplateInferenceHint();
   renderTemplateFieldControl();
+
+  const database = state.currentDatabase;
+  const table = state.currentTable;
+  const templateId = state.currentTemplateId;
+  if (!database || !table || !templateId) {
+    selectionRequests.abort('template-preview');
+    elements.sqlEditor.value = DEFAULT_SQL;
+    return;
+  }
+
+  const fieldState = getTemplateFieldState(templateId, table);
+  if (fieldState && !fieldState.activeField) {
+    selectionRequests.abort('template-preview');
+    elements.sqlEditor.value = fieldState.candidates.length
+      ? `-- 请先选择${fieldState.label}，再由服务端生成规范 SQL`
+      : `-- 当前表没有可用${fieldState.label}`;
+    return;
+  }
+
+  const fields = getQueryFields(templateId, table);
+  const key = getQueryPreviewKey(database, table, templateId, fields);
+  if (state.lastServerSql?.key === key) {
+    elements.sqlEditor.value = state.lastServerSql.sql;
+    return;
+  }
+
+  const request = selectionRequests.begin('template-preview');
+  elements.sqlEditor.value = '-- 正在向服务端请求规范 SQL...';
+  try {
+    const payload = await requestQueryPreview({ database, table, templateId, fields }, request.signal);
+    if (!request.isCurrent()) return;
+    const sql = String(payload.sql || '').trim();
+    if (!sql) throw new Error('服务端未返回规范 SQL。');
+    state.lastServerSql = { key, sql };
+    elements.sqlEditor.value = sql;
+    renderWorkflowSummary();
+  } catch (error) {
+    if (!request.isCurrent() || isAbortError(error)) return;
+    elements.sqlEditor.value = `-- 无法获取规范 SQL：${error.message}`;
+  } finally {
+    request.finish();
+  }
 }
 
 function getTemplateFieldSummary(templateId, tableName = state.currentTable) {
@@ -632,12 +754,12 @@ function renderTemplateFieldControl() {
 }
 
 function loadTasks() {
-  localStorage.removeItem(STORAGE_KEYS.tasks);
+  // Task queues are deliberately session-only because they depend on the active server connection.
   return [];
 }
 
 function saveTasks() {
-  localStorage.removeItem(STORAGE_KEYS.tasks);
+  // Intentionally not persisted; see loadTasks().
 }
 
 function clearTaskQueue(options = {}) {
@@ -778,6 +900,45 @@ function buildTable(rows, columns, className = 'data-table') {
   return table;
 }
 
+function buildPagination(pageData, onPageChange, label) {
+  const nav = document.createElement('nav');
+  nav.className = 'pagination-controls';
+  nav.setAttribute('aria-label', `${label}分页`);
+
+  const previous = document.createElement('button');
+  previous.type = 'button';
+  previous.className = 'chip-button';
+  previous.textContent = '上一页';
+  previous.disabled = pageData.page <= 1;
+  previous.addEventListener('click', () => onPageChange(pageData.page - 1));
+
+  const status = document.createElement('span');
+  status.className = 'pagination-status';
+  status.setAttribute('aria-live', 'polite');
+  status.textContent = `第 ${pageData.page}/${pageData.pageCount} 页 · 共 ${pageData.total} 条`;
+
+  const next = document.createElement('button');
+  next.type = 'button';
+  next.className = 'chip-button';
+  next.textContent = '下一页';
+  next.disabled = pageData.page >= pageData.pageCount;
+  next.addEventListener('click', () => onPageChange(pageData.page + 1));
+
+  nav.append(previous, status, next);
+  return nav;
+}
+
+function renderPagedTable(target, rows, columns, page, onPageChange, className, label) {
+  const pageData = paginate(rows, page, RESULT_PAGE_SIZE);
+  const fragment = document.createDocumentFragment();
+  fragment.appendChild(buildTable(pageData.items, columns, className));
+  if (pageData.pageCount > 1) {
+    fragment.appendChild(buildPagination(pageData, onPageChange, label));
+  }
+  target.replaceChildren(fragment);
+  return pageData.page;
+}
+
 function renderColumns() {
   elements.columnsCountLabel.textContent = `${state.columns.length} 个字段`;
   if (!state.columns.length) {
@@ -798,29 +959,72 @@ function renderColumns() {
 }
 
 function renderPreview() {
+  const completeness = describePreviewCompleteness(state.preview);
+  const previewLoaded = state.preview.columns.length > 0 || Number.isInteger(state.preview.rowLimit);
   elements.previewCountLabel.textContent = `${state.preview.rows.length} 行`;
-  if (!state.preview.rows.length) {
+  if (!state.preview.rows.length && !previewLoaded) {
     elements.previewDisclosure.open = false;
     elements.previewSummaryText.textContent = '未加载预览数据';
     elements.previewPane.className = 'data-pane empty-state';
     elements.previewPane.textContent = '选择表后显示预览数据。';
     return;
   }
-  elements.previewDisclosure.open = false;
-  elements.previewSummaryText.textContent = `已加载 ${state.preview.rows.length} 行，点击展开查看`;
+  elements.previewSummaryText.textContent = completeness.summary;
   elements.previewPane.className = 'data-pane';
-  elements.previewPane.replaceChildren(buildTable(state.preview.rows, state.preview.columns, 'data-table data-table-navicat'));
+  if (state.preview.rows.length) {
+    state.previewPage = renderPagedTable(
+      elements.previewPane,
+      state.preview.rows,
+      state.preview.columns,
+      state.previewPage,
+      (page) => { state.previewPage = page; renderPreview(); },
+      'data-table data-table-navicat',
+      '表数据预览'
+    );
+  } else {
+    const empty = document.createElement('p');
+    empty.className = 'preview-empty-message';
+    empty.textContent = '本次预览未返回数据行。';
+    elements.previewPane.replaceChildren(empty);
+  }
+  if (completeness.notices.length) {
+    const notice = document.createElement('div');
+    notice.className = 'preview-limit-notice';
+    notice.setAttribute('role', 'note');
+    notice.textContent = `预览范围：${completeness.notices.join('；')}。`;
+    elements.previewPane.prepend(notice);
+  }
 }
 
 function renderResult() {
-  elements.resultCountLabel.textContent = `${state.result.rows.length} 行`;
+  const completeness = describeQueryCompleteness(state.result);
+  elements.resultCountLabel.textContent = state.result.truncated
+    ? `已返回 ${state.result.rows.length} 行（达到上限）`
+    : `${state.result.rows.length} 行`;
   if (!state.result.rows.length) {
     elements.resultPane.className = 'data-pane empty-state';
-    elements.resultPane.textContent = '执行 SQL 后显示结果。';
+    elements.resultPane.textContent = Object.hasOwn(state.result, 'totalRowCount')
+      ? '本次查询未返回数据行。'
+      : '执行 SQL 后显示结果。';
     return;
   }
   elements.resultPane.className = 'data-pane';
-  elements.resultPane.replaceChildren(buildTable(state.result.rows, state.result.columns));
+  state.resultPage = renderPagedTable(
+    elements.resultPane,
+    state.result.rows,
+    state.result.columns,
+    state.resultPage,
+    (page) => { state.resultPage = page; renderResult(); },
+    'data-table',
+    '查询结果'
+  );
+  if (completeness.notices.length) {
+    const notice = document.createElement('div');
+    notice.className = 'preview-limit-notice';
+    notice.setAttribute('role', 'note');
+    notice.textContent = `结果范围：${completeness.notices.join('；')}。`;
+    elements.resultPane.prepend(notice);
+  }
 }
 
 function renderDatabaseOptions() {
@@ -837,6 +1041,7 @@ function renderDatabaseOptions() {
   });
   elements.databaseSelect.value = state.currentDatabase && state.databases.includes(state.currentDatabase) ? state.currentDatabase : '';
   elements.databaseSelect.disabled = !state.databases.length;
+  syncInteractionLocks();
 }
 
 function renderTableSelects() {
@@ -854,6 +1059,7 @@ function renderTableSelects() {
   elements.tableSelect.disabled = !state.tables.length;
   elements.tableSelect.value = state.currentTable && state.tables.some((table) => table.tableName === state.currentTable) ? state.currentTable : '';
   renderTaskTableChecklist();
+  syncInteractionLocks();
 }
 function renderTaskTableChecklist() {
   if (!state.tables.length) {
@@ -867,6 +1073,8 @@ function renderTaskTableChecklist() {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = `task-table-option${state.selectedTables.has(table.tableName) ? ' is-selected' : ''}`;
+    button.setAttribute('aria-pressed', String(state.selectedTables.has(table.tableName)));
+    button.disabled = PREVIEW_MODE || state.batchRunning || singleRunLock.locked;
     const check = document.createElement('span');
     check.className = 'task-table-option-check';
     check.textContent = state.selectedTables.has(table.tableName) ? '✓' : '';
@@ -896,7 +1104,7 @@ function getSelectedTableInfos() {
   return state.tables.filter((table) => state.selectedTables.has(table.tableName));
 }
 
-function buildSelectedTablesSqlScript(options = {}) {
+async function buildSelectedTablesSqlScript(options = {}, request) {
   const excludeIds = new Set(options.excludeTemplateIds || []);
   const templates = QUERY_TEMPLATES.filter((template) => !excludeIds.has(template.id));
 
@@ -915,70 +1123,99 @@ function buildSelectedTablesSqlScript(options = {}) {
   if (!templates.length) {
     throw new Error('当前没有可用的模板（已全部被排除）。');
   }
+  if (selectedTables.length * templates.length > 500) {
+    throw new Error('一次最多复制 500 段规范 SQL，请减少目标表或模板后重试。');
+  }
 
-  const sections = [
-    `-- Database: ${state.currentDatabase}`,
-    `USE ${escapeIdentifier(state.currentDatabase)};`,
-    ''
-  ];
-
-  let executableCount = 0;
+  const database = state.currentDatabase;
+  const sections = [`-- Database: ${database}`, ''];
   const issues = [];
+  const jobs = selectedTables.flatMap((tableInfo) => templates.map((template) => ({
+    tableInfo,
+    template,
+    fields: getQueryFields(template.id, tableInfo.tableName)
+  })));
+  const results = await mapWithConcurrency(jobs, 4, async ({ tableInfo, template, fields }) => {
+    if (!isTemplateSupported(tableInfo, template.id)) {
+      const reason = getTemplateSkipReason(tableInfo, template.id);
+      return { ok: false, sql: `-- ${reason}`, reason };
+    }
 
-  selectedTables.forEach((tableInfo, tableIndex) => {
+    try {
+      const payload = await requestQueryPreview({
+        database,
+        table: tableInfo.tableName,
+        templateId: template.id,
+        fields
+      }, request.signal);
+      if (!request.isCurrent()) {
+        const staleError = new Error('SQL 复制请求已被较新的操作替代。');
+        staleError.name = 'AbortError';
+        throw staleError;
+      }
+      const sql = String(payload.sql || '').trim();
+      if (!sql) throw new Error('服务端未返回规范 SQL。');
+      return { ok: true, sql, reason: '' };
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      const reason = error.message || '无法获取规范 SQL';
+      return { ok: false, sql: `-- ${reason}`, reason };
+    }
+  });
+
+  for (const [tableIndex, tableInfo] of selectedTables.entries()) {
     if (tableIndex > 0) {
       sections.push('');
     }
 
     sections.push(`-- ===== Table: ${tableInfo.tableName}${tableInfo.tableComment ? ` (${String(tableInfo.tableComment).trim()})` : ''} =====`);
 
-    templates.forEach((template) => {
-      const sql = buildTemplateSql(template.id, state.currentDatabase, tableInfo.tableName, tableInfo.tableComment || '');
+    for (const [templateIndex, template] of templates.entries()) {
+      const result = results[(tableIndex * templates.length) + templateIndex];
       sections.push(`-- [${template.name}]`);
-      sections.push(sql);
-      sections.push('');
-      if (!sql.startsWith('--')) {
-        executableCount += 1;
-        return;
+      sections.push(result.sql, '');
+      if (!result.ok) {
+        issues.push({ tableName: tableInfo.tableName, templateName: template.name, reason: result.reason });
       }
-
-      issues.push({
-        tableName: tableInfo.tableName,
-        templateName: template.name,
-        reason: sql.slice(3).trim() || '当前模板不可执行'
-      });
-    });
-  });
+    }
+  }
 
   return {
     script: sections.join('\n').trim(),
     tableCount: selectedTables.length,
     blockCount: selectedTables.length * templates.length,
     templateCount: templates.length,
-    executableCount,
+    executableCount: results.filter((result) => result.ok).length,
     issues
   };
 }
 
 async function copySelectedTablesSqlScript(options = {}) {
-  const payload = buildSelectedTablesSqlScript(options);
-  await copyTextToClipboard(payload.script);
-  const suffix = options.label ? `（${options.label}）` : '';
-  if (payload.issues.length) {
-    const issueSummary = payload.issues
-      .map((issue) => `表 ${issue.tableName} / ${issue.templateName}: ${issue.reason}`)
-      .join('\n');
-    window.alert(
-      `已复制 ${payload.tableCount} 张表的 ${payload.blockCount} 段模板脚本${suffix}。\n\n其中 ${payload.issues.length} 段当前不可执行，定位如下：\n${issueSummary}`
-    );
-    setStatus(
-      `已复制 ${payload.tableCount} 张表的 ${payload.blockCount} 段模板脚本${suffix}，其中 ${payload.executableCount} 段可直接执行；不可执行原因已提示。`,
-      'error'
-    );
-    return;
+  const request = selectionRequests.begin('copy-sql');
+  elements.copySelectedSqlButton.disabled = true;
+  try {
+    const payload = await buildSelectedTablesSqlScript(options, request);
+    if (!request.isCurrent()) return;
+    await copyTextToClipboard(payload.script);
+    const suffix = options.label ? `（${options.label}）` : '';
+    if (payload.issues.length) {
+      const issueSummary = payload.issues
+        .slice(0, 30)
+        .map((issue) => `表 ${issue.tableName} / ${issue.templateName}: ${issue.reason}`)
+        .join('\n');
+      window.alert(
+        `已复制 ${payload.tableCount} 张表的 ${payload.blockCount} 段服务端规范 SQL${suffix}。\n\n其中 ${payload.issues.length} 段未能获取：\n${issueSummary}`
+      );
+      setStatus(`已复制 ${payload.executableCount} 段规范 SQL；${payload.issues.length} 段失败。`, 'error');
+      return;
+    }
+    setStatus(`已复制 ${payload.tableCount} 张表的 ${payload.blockCount} 段服务端规范 SQL${suffix}。`, 'success');
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+  } finally {
+    request.finish();
+    renderWorkflowSummary();
   }
-
-  setStatus(`已复制 ${payload.tableCount} 张表的 ${payload.blockCount} 段模板脚本${suffix}，全部可直接执行。`, 'success');
 }
 
 function renderPillList(target, items, emptyText) {
@@ -1024,7 +1261,7 @@ function renderWorkflowSummary() {
           : '请先勾选至少一张目标表，再生成批量任务。';
   }
   if (elements.copySelectedSqlButton) {
-    elements.copySelectedSqlButton.disabled = !state.currentDatabase || !selectedTables.length;
+    elements.copySelectedSqlButton.disabled = PREVIEW_MODE || !state.templatesReady || !state.currentDatabase || !selectedTables.length || singleRunLock.locked || state.batchRunning;
     const copyTip = !state.currentDatabase
       ? '请先选择数据库'
       : selectedTables.length
@@ -1044,7 +1281,7 @@ function renderWorkflowSummary() {
     elements.copySelectedSqlButtonNoStructure.title = copyTipNoStructure;
   }
   if (elements.clearTasksButton) {
-    elements.clearTasksButton.disabled = !state.tasks.length || state.batchRunning;
+    elements.clearTasksButton.disabled = !state.tasks.length || state.batchRunning || PREVIEW_MODE;
   }
 }
 
@@ -1090,6 +1327,38 @@ function syncBatchActionButtons() {
     elements.batchProgressDockStopButton.disabled = !state.batchRunning || state.batchCancelRequested;
     elements.batchProgressDockStopButton.textContent = state.batchCancelRequested ? '结束处理中...' : '提前结束';
   }
+  syncInteractionLocks();
+}
+
+function syncInteractionLocks() {
+  const busy = state.batchRunning || singleRunLock.locked;
+  const actionsUnavailable = PREVIEW_MODE || !state.templatesReady;
+  if (elements.databaseSelect) {
+    elements.databaseSelect.disabled = PREVIEW_MODE || busy || !state.databases.length;
+  }
+  if (elements.tableSelect) {
+    elements.tableSelect.disabled = busy || !state.tables.length;
+  }
+  if (elements.refreshTablesButton) elements.refreshTablesButton.disabled = PREVIEW_MODE || busy;
+  if (elements.previewLimitInput) elements.previewLimitInput.disabled = busy;
+  if (elements.taskNameInput) elements.taskNameInput.disabled = busy;
+  if (elements.runQueryButton) elements.runQueryButton.disabled = actionsUnavailable || busy || !state.currentTable;
+  if (elements.runAndCaptureButton) elements.runAndCaptureButton.disabled = actionsUnavailable || busy || !state.currentTable;
+  if (elements.saveTaskButton) elements.saveTaskButton.disabled = actionsUnavailable || busy;
+  if (elements.runTasksButton) elements.runTasksButton.disabled = actionsUnavailable || state.batchRunning || singleRunLock.locked;
+  if (elements.clearSelectedTablesButton) elements.clearSelectedTablesButton.disabled = PREVIEW_MODE || busy;
+  if (elements.selectAllTablesButton) elements.selectAllTablesButton.disabled = PREVIEW_MODE || busy;
+  document.querySelectorAll('.sql-template-option').forEach((button) => {
+    button.disabled = busy || !state.templatesReady;
+  });
+  document.querySelectorAll('.task-table-option').forEach((button) => {
+    button.disabled = PREVIEW_MODE || busy;
+  });
+  if (busy) {
+    elements.tasksPane?.querySelectorAll('button, input').forEach((control) => {
+      control.disabled = true;
+    });
+  }
 }
 
 function updateBatchProgressUi(text = '尚未开始') {
@@ -1098,6 +1367,16 @@ function updateBatchProgressUi(text = '尚未开始') {
   }
   if (elements.batchProgressDockText) {
     elements.batchProgressDockText.textContent = text;
+  }
+  const total = Math.max(0, state.batchTotal || 0);
+  const settled = state.batchLedger?.counts().settled ?? state.batchCompleted;
+  const percent = total ? Math.min(100, Math.round((settled / total) * 100)) : 0;
+  if (elements.batchProgressFill) {
+    elements.batchProgressFill.style.width = `${percent}%`;
+  }
+  if (elements.batchProgressBar) {
+    elements.batchProgressBar.setAttribute('aria-valuenow', String(percent));
+    elements.batchProgressBar.setAttribute('aria-valuetext', text);
   }
 }
 
@@ -1116,6 +1395,7 @@ function resetBatchRuntimeState() {
   state.batchFailures = 0;
   state.batchStartedAt = 0;
   state.batchTotal = 0;
+  state.batchLedger = null;
 }
 
 function requestBatchCancellation() {
@@ -1127,10 +1407,18 @@ function requestBatchCancellation() {
     return;
   }
   state.batchCancelRequested = true;
+  const queuedCancelled = state.batchLedger?.cancelQueued() || 0;
+  state.tasks.forEach((task) => {
+    if (state.batchLedger?.getStatus(task.id) === 'cancelled' && task.runStatus === 'queued') {
+      setTaskRuntimeStatus(task, 'cancelled');
+    }
+  });
   state.batchAbortControllers.forEach((controller) => controller.abort());
+  syncBatchCounters();
+  scheduleTaskRender();
   syncBatchActionButtons();
   updateBatchProgressUi(
-    `正在提前结束... 已完成 ${state.batchCompleted}/${state.batchTotal || 0}，失败 ${state.batchFailures} 个`
+    `正在提前结束... 已结算 ${state.batchCompleted}/${state.batchTotal || 0}，新取消 ${queuedCancelled} 个`
   );
   setStatus('已请求提前结束批量任务。未开始的任务将停止调度，已发出的任务可能仍会继续完成。', 'error');
 }
@@ -1141,6 +1429,7 @@ function collapseBatchModal() {
   elements.batchConfirmModal.classList.add('is-hidden');
   elements.batchConfirmModal.setAttribute('aria-hidden', 'true');
   syncBatchProgressDock();
+  elements.batchProgressDockToggle?.focus();
 }
 
 function expandBatchModal() {
@@ -1149,6 +1438,7 @@ function expandBatchModal() {
   elements.batchConfirmModal.classList.remove('is-hidden');
   elements.batchConfirmModal.setAttribute('aria-hidden', 'false');
   syncBatchProgressDock();
+  window.requestAnimationFrame(() => elements.batchModalStopButton?.focus());
 }
 
 function closeBatchModal(force = false) {
@@ -1164,6 +1454,10 @@ function closeBatchModal(force = false) {
   resetBatchRuntimeState();
   syncBatchActionButtons();
   syncBatchProgressDock();
+  if (modalReturnFocus?.isConnected) {
+    modalReturnFocus.focus();
+  }
+  modalReturnFocus = null;
 }
 
 function openBatchModal() {
@@ -1175,8 +1469,13 @@ function openBatchModal() {
 
   const taskTableNames = [...new Set(tasks.map((task) => task.tableName))];
   renderPillList(elements.batchModalTables, taskTableNames, '暂无数据');
-  elements.batchModalSummary.textContent = `当前数据库 ${state.currentDatabase}，将执行 ${tasks.length} 个具体任务，覆盖 ${taskTableNames.length} 张表。确认后会按“任务模板文件夹/表名文件夹/图片名称.png”的结构批量保存 PNG，失败项会在下方输出记录中显示原因和本地日志路径。`;
+  elements.batchModalSummary.textContent = `当前数据库 ${state.currentDatabase}，将执行 ${tasks.length} 个具体任务，覆盖 ${taskTableNames.length} 张表。实际输出目录和文件名以服务端返回的截图产物为准。`;
   elements.batchProgressFill.style.width = '0%';
+  const hasStorageTask = tasks.some((task) => templateRequiresAnalyze(task.templateId));
+  elements.batchAnalyzeOption?.classList.toggle('is-hidden', !hasStorageTask);
+  if (elements.analyzeBeforeRunCheckbox) {
+    elements.analyzeBeforeRunCheckbox.checked = false;
+  }
   state.batchModalCollapsed = false;
   state.batchCancelRequested = false;
   state.batchCancelledCount = 0;
@@ -1186,8 +1485,12 @@ function openBatchModal() {
   updateBatchProgressUi('尚未开始');
   syncBatchActionButtons();
   syncBatchProgressDock();
+  modalReturnFocus = document.activeElement && typeof document.activeElement.focus === 'function'
+    ? document.activeElement
+    : null;
   elements.batchConfirmModal.classList.remove('is-hidden');
   elements.batchConfirmModal.setAttribute('aria-hidden', 'false');
+  window.requestAnimationFrame(() => elements.batchModalConfirmButton?.focus());
 }
 
 async function analyzeTableRequest(tableName) {
@@ -1199,7 +1502,8 @@ async function analyzeTableRequest(tableName) {
       signal: controller.signal,
       body: JSON.stringify({
         database: state.currentDatabase,
-        table: tableName
+        table: tableName,
+        confirm: true
       })
     });
   } finally {
@@ -1257,9 +1561,54 @@ async function runAnalyzePhase(tableNames, queryTaskCount) {
   );
 }
 
+function syncBatchCounters() {
+  const counts = state.batchLedger?.counts();
+  if (!counts) return null;
+  state.batchCompleted = counts.settled;
+  state.batchFailures = counts.failed;
+  state.batchCancelledCount = counts.cancelled;
+  if (state.runContext?.kind === 'batch') {
+    state.runStats.success = counts.succeeded;
+    state.runStats.failure = counts.failed;
+    state.runStats.cancelled = counts.cancelled;
+    state.runStats.total = counts.settled + state.runStats.warning;
+  }
+  return counts;
+}
+
+function scheduleTaskRender() {
+  if (taskRenderScheduled) return;
+  taskRenderScheduled = true;
+  window.requestAnimationFrame(() => {
+    taskRenderScheduled = false;
+    renderTasks();
+  });
+}
+
+function setTaskRuntimeStatus(task, status) {
+  task.runStatus = status;
+  const badge = taskStatusNodes.get(task.id);
+  if (!badge) return;
+  badge.className = status === 'failed' || status === 'cancelled'
+    ? 'badge badge-outline'
+    : 'badge badge-muted';
+  badge.textContent = TASK_STATUS_LABELS[status] || status;
+}
+
 async function executeBatchRun() {
-  const tasks = state.batchTasksOverride || state.tasks.filter((task) => task.enabled);
+  if (!state.templatesReady || PREVIEW_MODE) {
+    setStatus('模板元数据尚未就绪，批量执行已停用。', 'error');
+    return;
+  }
+  const releaseLock = batchRunLock.tryAcquire();
+  if (!releaseLock) {
+    setStatus('批量任务已经在执行，请勿重复提交。', 'error');
+    return;
+  }
+
+  const tasks = (state.batchTasksOverride || state.tasks.filter((task) => task.enabled)).slice();
   if (!tasks.length) {
+    releaseLock();
     setStatus('没有可执行的批量任务。', 'error');
     return;
   }
@@ -1271,165 +1620,155 @@ async function executeBatchRun() {
   state.batchCancelledCount = 0;
   state.batchCancelRequested = false;
   state.batchStartedAt = performance.now();
+  state.batchLedger = createRunLedger(tasks.map((task) => task.id));
+  tasks.forEach((task) => { setTaskRuntimeStatus(task, 'queued'); });
   syncBatchActionButtons();
+  scheduleTaskRender();
 
   const firstFolderName = tasks.find((task) => task.folderName)?.folderName || elements.taskNameInput?.value?.trim() || '';
   beginRun({ folderName: firstFolderName, kind: 'batch' });
-
-  const analyzeTargets = [...new Set(
-    tasks.filter((task) => task.templateId === 'storage-usage').map((task) => task.tableName)
-  )];
-
-  if (analyzeTargets.length && !state.batchCancelRequested) {
-    await runAnalyzePhase(analyzeTargets, tasks.length);
-  }
-
-  const concurrency = getBatchConcurrency(tasks.length);
-  updateBatchProgressUi(`0 / ${tasks.length} · 准备执行（并发 ${concurrency}）`);
-
+  const database = state.currentDatabase;
+  const analyzeRequested = Boolean(elements.analyzeBeforeRunCheckbox?.checked);
   let nextIndex = 0;
 
-  const executeSingleTask = async (job, workerId) => {
-    const startedAt = performance.now();
-    const tableInfo = getTableInfo(job.tableName) || { tableName: job.tableName, tableComment: '' };
-    const sql = buildTemplateSql(job.templateId, state.currentDatabase, tableInfo.tableName, tableInfo.tableComment || '');
-    const template = getTemplateById(job.templateId);
-    const taskTitle = formatTaskTitle(job, tableInfo, template);
-
-    if (sql.startsWith('--')) {
-      state.batchFailures += 1;
-      state.batchCompleted += 1;
-      elements.batchProgressFill.style.width = `${(state.batchCompleted / tasks.length) * 100}%`;
-      updateBatchProgressUi(`${state.batchCompleted} / ${tasks.length} · 跳过 ${tableInfo.tableName}`);
-      appendRunEntry({
-        kind: 'error',
-        title: taskTitle,
-        tableName: tableInfo.tableName,
-        templateName: template.name,
-        reason: sql.slice(3).trim() || '当前任务缺少可执行字段。',
-        message: '当前任务未提交到服务端，请重新生成批量任务队列后再执行。',
-        durationMs: performance.now() - startedAt
-      });
-      return;
+  try {
+    const analyzeTargets = analyzeRequested
+      ? [...new Set(tasks.filter((task) => templateRequiresAnalyze(task.templateId)).map((task) => task.tableName))]
+      : [];
+    if (analyzeTargets.length && !state.batchCancelRequested) {
+      await runAnalyzePhase(analyzeTargets, tasks.length);
     }
 
-    const controller = new AbortController();
-    state.batchAbortControllers.add(controller);
+    const concurrency = getBatchConcurrency(tasks.length);
+    updateBatchProgressUi(`0 / ${tasks.length} · 准备执行（并发 ${concurrency}）`);
 
-    try {
-      const payload = await api('/api/query', {
-        method: 'POST',
-        signal: controller.signal,
-        body: JSON.stringify({
-          database: state.currentDatabase,
-          table: tableInfo.tableName,
-          tableComment: tableInfo.tableComment || '',
-          sql,
-          capture: true,
-          taskName: job.folderName,
-          imageName: template.name,
-          templateId: job.templateId,
-          captureProfileKey: `batch-worker-${workerId}`,
-          captureOptions: {
-            hideSql: job.templateId === 'table-structure',
-            showTableMeta: job.templateId === 'table-structure'
-          }
-        })
-      });
+    const executeSingleTask = async (job, workerId) => {
+      if (!state.batchLedger.markRunning(job.id)) return;
+      setTaskRuntimeStatus(job, 'running');
+      const startedAt = performance.now();
+      const tableInfo = getTableInfo(job.tableName) || { tableName: job.tableName, tableComment: '' };
+      const template = getTemplateById(job.templateId);
+      const taskTitle = formatTaskTitle(job, tableInfo, template);
+      const controller = new AbortController();
+      state.batchAbortControllers.add(controller);
 
-      if (payload.artifact) {
+      try {
+        const payload = await api('/api/query', {
+          method: 'POST',
+          signal: controller.signal,
+          body: JSON.stringify(buildQueryRequest({
+            database,
+            table: tableInfo.tableName,
+            templateId: job.templateId,
+            fields: getQueryFields(job.templateId, tableInfo.tableName),
+            capture: true,
+            taskName: job.folderName,
+            runId: state.runContext.runId,
+            captureProfileKey: `batch-worker-${workerId}`
+          }))
+        });
+        const artifact = requireCaptureArtifact(payload);
+        const completeness = describeCaptureCompleteness(artifact);
+        state.batchLedger.markSucceeded(job.id);
+        setTaskRuntimeStatus(job, 'succeeded');
         appendRunEntry({
           kind: 'success',
           title: taskTitle,
           tableName: tableInfo.tableName,
           templateName: template.name,
-          imagePath: payload.artifact.imagePath,
+          imagePath: artifact.imagePath,
+          folderPath: artifact.folderPath,
+          message: completeness.summary,
           durationMs: performance.now() - startedAt
         });
-      }
-    } catch (error) {
-      if (controller.signal.aborted && state.batchCancelRequested) {
-        state.batchCancelledCount += 1;
-        appendRunEntry({
-          kind: 'error',
+        appendArtifactCompletenessWarning(artifact, {
           title: taskTitle,
           tableName: tableInfo.tableName,
-          templateName: template.name,
-          reason: '用户提前结束批量任务，客户端已停止等待该任务。',
-          message: '已经提交到数据库或浏览器的任务可能仍会继续完成，已生成的图片和日志会保留在本地。',
-          durationMs: performance.now() - startedAt
+          templateName: template.name
         });
-      } else {
-        state.batchFailures += 1;
-        const details = describeApiError(error);
-        appendRunEntry({
-          kind: 'error',
-          title: taskTitle,
-          tableName: tableInfo.tableName,
-          templateName: template.name,
-          reason: details.reason,
-          logPath: details.logPath,
-          message: details.message,
-          durationMs: performance.now() - startedAt
-        });
-        console.warn(error);
+      } catch (error) {
+        if ((controller.signal.aborted || isAbortError(error)) && state.batchCancelRequested) {
+          state.batchLedger.markCancelled(job.id);
+          setTaskRuntimeStatus(job, 'cancelled');
+          appendRunEntry({
+            kind: 'cancelled',
+            title: taskTitle,
+            tableName: tableInfo.tableName,
+            templateName: template.name,
+            reason: '用户提前结束，客户端已中断等待该任务。',
+            durationMs: performance.now() - startedAt
+          });
+        } else {
+          state.batchLedger.markFailed(job.id);
+          setTaskRuntimeStatus(job, 'failed');
+          const details = describeApiError(error);
+          appendRunEntry({
+            kind: 'error',
+            title: taskTitle,
+            tableName: tableInfo.tableName,
+            templateName: template.name,
+            reason: details.reason || details.message,
+            logPath: details.logPath,
+            message: details.message,
+            durationMs: performance.now() - startedAt
+          });
+          console.warn(error);
+        }
+      } finally {
+        state.batchAbortControllers.delete(controller);
+        const counts = syncBatchCounters();
+        scheduleRunRender();
+        updateBatchProgressUi(
+          state.batchCancelRequested
+            ? `${counts.settled} / ${tasks.length} · 正在提前结束`
+            : counts.failed
+              ? `${counts.settled} / ${tasks.length} · 已失败 ${counts.failed} 个`
+              : `${counts.settled} / ${tasks.length} · 执行中`
+        );
       }
-    } finally {
-      state.batchAbortControllers.delete(controller);
-      state.batchCompleted += 1;
-      elements.batchProgressFill.style.width = `${(state.batchCompleted / tasks.length) * 100}%`;
-      updateBatchProgressUi(
-        state.batchCancelRequested
-          ? `${state.batchCompleted} / ${tasks.length} · 正在提前结束`
-          : state.batchFailures
-            ? `${state.batchCompleted} / ${tasks.length} · 已出现 ${state.batchFailures} 个失败项`
-            : `${state.batchCompleted} / ${tasks.length} · 执行中`
-      );
-    }
-  };
+    };
 
-  const runWorker = async (workerId) => {
-    while (nextIndex < tasks.length && !state.batchCancelRequested) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-      await executeSingleTask(tasks[currentIndex], workerId);
-    }
-  };
+    const runWorker = async (workerId) => {
+      while (nextIndex < tasks.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await executeSingleTask(tasks[currentIndex], workerId);
+      }
+    };
 
-  await Promise.all(
-    Array.from({ length: concurrency }, (_, workerId) => runWorker(workerId))
-  );
-
-  if (state.batchCancelRequested) {
-    state.batchCancelledCount += Math.max(0, tasks.length - nextIndex);
+    await Promise.all(Array.from({ length: concurrency }, (_, workerId) => runWorker(workerId)));
+    syncBatchCounters();
+  } finally {
+    state.batchRunning = false;
+    const counts = syncBatchCounters() || { succeeded: 0, failed: 0, cancelled: 0 };
+    const finalCompleted = counts.succeeded + counts.failed;
+    const finalFailures = counts.failed;
+    const finalCancelled = counts.cancelled;
+    const wasCancelled = state.batchCancelRequested;
+    const totalDurationMs = performance.now() - state.batchStartedAt;
+    finalizeRun();
+    updateBatchProgressUi(
+      wasCancelled
+        ? `已提前结束 · 完成 ${finalCompleted}/${tasks.length}，取消 ${finalCancelled} 个，总耗时 ${formatDuration(totalDurationMs)}`
+        : finalFailures
+          ? `执行结束 · 完成 ${finalCompleted}/${tasks.length}，失败 ${finalFailures} 个，总耗时 ${formatDuration(totalDurationMs)}`
+          : `执行结束 · ${counts.succeeded}/${tasks.length} 全部成功，总耗时 ${formatDuration(totalDurationMs)}`
+    );
+    releaseLock();
+    syncBatchActionButtons();
+    closeBatchModal(true);
+    scheduleTaskRender();
+    renderWorkflowSummary();
+    updateStepStates();
+    setStatus(
+      wasCancelled
+        ? `批量任务已提前结束。完成 ${finalCompleted} 个，取消 ${finalCancelled} 个，总耗时 ${formatDuration(totalDurationMs)}。`
+        : finalFailures
+          ? `批量截图完成，但有 ${finalFailures} 个失败项，批量耗时 ${formatDuration(totalDurationMs)}。`
+          : `批量截图完成，共生成 ${counts.succeeded} 张截图，批量耗时 ${formatDuration(totalDurationMs)}。`,
+      wasCancelled || finalFailures ? 'error' : 'success'
+    );
   }
-
-  state.batchRunning = false;
-  const finalCompleted = state.batchCompleted;
-  const finalFailures = state.batchFailures;
-  const finalCancelled = state.batchCancelledCount;
-  const wasCancelled = state.batchCancelRequested;
-  const totalDurationMs = performance.now() - state.batchStartedAt;
-  finalizeRun();
-  updateBatchProgressUi(
-    wasCancelled
-      ? `已提前结束 · 已完成 ${finalCompleted}/${tasks.length}，取消 ${finalCancelled} 个，总耗时 ${formatDuration(totalDurationMs)}`
-      : finalFailures
-        ? `执行结束 · ${finalCompleted}/${tasks.length}，失败 ${finalFailures} 个，总耗时 ${formatDuration(totalDurationMs)}`
-        : `执行结束 · ${finalCompleted}/${tasks.length} 全部成功，总耗时 ${formatDuration(totalDurationMs)}`
-  );
-  syncBatchActionButtons();
-  closeBatchModal(true);
-  renderWorkflowSummary();
-  updateStepStates();
-  setStatus(
-    wasCancelled
-      ? `批量任务已提前结束。已完成 ${finalCompleted} 个，取消 ${finalCancelled} 个，总耗时 ${formatDuration(totalDurationMs)}。`
-      : finalFailures
-        ? `批量截图完成，但有 ${finalFailures} 个失败项，批量耗时 ${formatDuration(totalDurationMs)}。`
-        : `批量截图完成，共生成 ${finalCompleted} 张截图，批量耗时 ${formatDuration(totalDurationMs)}。`,
-    wasCancelled || finalFailures ? 'error' : 'success'
-  );
 }
 
 function renderQueryTemplates() {
@@ -1439,6 +1778,7 @@ function renderQueryTemplates() {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = `sql-template-option${template.id === state.currentTemplateId ? ' is-active' : ''}`;
+    button.setAttribute('aria-pressed', String(template.id === state.currentTemplateId));
     const title = document.createElement('strong');
     title.textContent = template.name;
     const desc = document.createElement('span');
@@ -1453,10 +1793,13 @@ function renderQueryTemplates() {
     wrapper.appendChild(button);
   });
   elements.sqlTemplateList.replaceChildren(wrapper);
+  syncInteractionLocks();
 }
 
 function renderTasks() {
+  taskStatusNodes.clear();
   if (!state.tasks.length) {
+    state.taskPage = 1;
     elements.taskCountLabel.textContent = '0 张表';
     elements.tasksPane.className = 'task-list empty-state';
     elements.tasksPane.textContent = '还没有生成具体批量任务。';
@@ -1474,8 +1817,10 @@ function renderTasks() {
   elements.taskCountLabel.textContent = `${groups.size} 张表 · ${state.tasks.length} 个任务`;
   const wrapper = document.createElement('div');
   wrapper.className = 'task-group-list';
+  const groupPage = paginate([...groups.entries()], state.taskPage, TASK_GROUP_PAGE_SIZE);
+  state.taskPage = groupPage.page;
 
-  [...groups.entries()].forEach(([tableName, tasks]) => {
+  groupPage.items.forEach(([tableName, tasks]) => {
     const tableInfo = getTableInfo(tableName) || { tableName, tableComment: '' };
     const enabledCount = tasks.filter((task) => task.enabled).length;
     const unsupportedCount = tasks.filter((task) => !isTemplateSupported(tableInfo, task.templateId)).length;
@@ -1541,6 +1886,7 @@ function renderTasks() {
         const toggle = document.createElement('input');
         toggle.type = 'checkbox';
         toggle.checked = task.enabled;
+        toggle.disabled = state.batchRunning || singleRunLock.locked;
         toggle.addEventListener('change', () => {
           task.enabled = toggle.checked;
           saveTasks();
@@ -1553,15 +1899,18 @@ function renderTasks() {
         const info = document.createElement('p');
         info.className = 'task-row-note';
         info.textContent = supported
-          ? `预计输出目录：${task.folderName}/${tableInfo.tableName}/${template.name}.png`
+          ? '实际输出目录和文件名由服务端返回的截图产物决定。'
           : `当前不可执行：${supportReason}`;
         headLeft.append(toggleWrap, info);
 
         const rowMeta = document.createElement('div');
         rowMeta.className = 'task-row-meta';
         const stateBadge = document.createElement('span');
-        stateBadge.className = supported ? 'badge badge-muted' : 'badge badge-outline';
-        stateBadge.textContent = supported ? '可执行' : '字段待补';
+        stateBadge.className = task.runStatus === 'failed' || task.runStatus === 'cancelled'
+          ? 'badge badge-outline'
+          : 'badge badge-muted';
+        stateBadge.textContent = task.runStatus ? TASK_STATUS_LABELS[task.runStatus] : supported ? '可执行' : '字段待补';
+        taskStatusNodes.set(task.id, stateBadge);
         rowMeta.appendChild(stateBadge);
 
         rowHead.append(headLeft, rowMeta);
@@ -1569,8 +1918,8 @@ function renderTasks() {
         const sql = document.createElement('pre');
         sql.className = 'task-sql';
         sql.textContent = supported
-          ? buildTemplateSql(task.templateId, state.currentDatabase, tableInfo.tableName || '', tableInfo.tableComment || '')
-          : `-- ${supportReason}`;
+          ? `模板：${template.name}\n模板 ID：${template.id}\n规范 SQL 将在执行时由服务端生成。`
+          : `模板：${template.name}\n当前不可执行：${supportReason}`;
         const fieldSummary = getTemplateFieldSummary(task.templateId, tableInfo.tableName);
         const sqlMeta = document.createElement('p');
         sqlMeta.className = 'task-row-field-note';
@@ -1583,6 +1932,7 @@ function renderTasks() {
         loadButton.type = 'button';
         loadButton.className = 'button button-secondary';
         loadButton.textContent = '载入';
+        loadButton.disabled = state.batchRunning || singleRunLock.locked;
         loadButton.addEventListener('click', async () => {
           state.currentTemplateId = task.templateId;
           elements.taskNameInput.value = task.folderName;
@@ -1596,6 +1946,7 @@ function renderTasks() {
         deleteButton.type = 'button';
         deleteButton.className = 'button button-ghost';
         deleteButton.textContent = '删除';
+        deleteButton.disabled = state.batchRunning || singleRunLock.locked;
         deleteButton.addEventListener('click', () => {
           state.tasks = state.tasks.filter((item) => item.id !== task.id);
           saveTasks();
@@ -1607,7 +1958,7 @@ function renderTasks() {
         runButton.type = 'button';
         runButton.className = 'button button-primary';
         runButton.textContent = '执行此任务';
-        runButton.disabled = !supported;
+        runButton.disabled = !supported || state.batchRunning || PREVIEW_MODE;
         if (!supported) {
           runButton.title = supportReason;
         }
@@ -1628,6 +1979,13 @@ function renderTasks() {
     wrapper.appendChild(details);
   });
 
+  if (groupPage.pageCount > 1) {
+    wrapper.appendChild(buildPagination(groupPage, (page) => {
+      state.taskPage = page;
+      renderTasks();
+    }, '批量任务队列'));
+  }
+
   elements.tasksPane.className = '';
   elements.tasksPane.replaceChildren(wrapper);
   renderWorkflowSummary();
@@ -1645,15 +2003,20 @@ function describeApiError(error) {
 function beginRun({ folderName, kind }) {
   state.runContext = {
     folderName: String(folderName || '').trim(),
+    folderPath: '',
     kind: kind === 'batch' ? 'batch' : 'single',
+    runId: createRunId(),
     startedAt: performance.now(),
     finished: false
   };
   state.runEntries = [];
+  state.runEntriesByKind = { success: [], warning: [], failure: [], cancelled: [] };
+  state.runPages = { success: 1, warning: 1, failure: 1, cancelled: 1 };
   state.runStats = {
     success: 0,
     warning: 0,
     failure: 0,
+    cancelled: 0,
     total: 0,
     durationMs: 0,
     tables: new Set()
@@ -1672,6 +2035,7 @@ function appendRunEntry(entry) {
     tableName: entry.tableName || '',
     templateName: entry.templateName || '',
     imagePath: entry.imagePath || '',
+    folderPath: entry.folderPath || '',
     reason: entry.reason || '',
     logPath: entry.logPath || '',
     message: entry.message || '',
@@ -1679,13 +2043,41 @@ function appendRunEntry(entry) {
     timestamp: Date.now()
   };
   state.runEntries.push(normalized);
+  const entryKind = normalized.kind === 'error' ? 'failure' : normalized.kind;
+  state.runEntriesByKind[entryKind]?.push(normalized);
+  if (normalized.folderPath) {
+    state.runContext.folderPath = normalized.folderPath;
+  }
   if (normalized.kind === 'success') state.runStats.success += 1;
   else if (normalized.kind === 'warning') state.runStats.warning += 1;
+  else if (normalized.kind === 'cancelled') state.runStats.cancelled += 1;
   else state.runStats.failure += 1;
   state.runStats.total = state.runEntries.length;
   if (normalized.tableName) state.runStats.tables.add(normalized.tableName);
-  renderRunSummary();
-  updateStepStates();
+  scheduleRunRender();
+}
+
+function appendArtifactCompletenessWarning(artifact, context) {
+  if (!artifact.truncated) return;
+  const completeness = describeCaptureCompleteness(artifact);
+  appendRunEntry({
+    kind: 'warning',
+    title: `${context.title} / ${completeness.warningTitle}`,
+    tableName: context.tableName,
+    templateName: context.templateName,
+    reason: completeness.summary,
+    message: completeness.warningMessage
+  });
+}
+
+function scheduleRunRender() {
+  if (runRenderScheduled) return;
+  runRenderScheduled = true;
+  window.requestAnimationFrame(() => {
+    runRenderScheduled = false;
+    renderRunSummary();
+    updateStepStates();
+  });
 }
 
 function finalizeRun() {
@@ -1693,14 +2085,15 @@ function finalizeRun() {
   state.runContext.finished = true;
   state.runStats.durationMs = performance.now() - state.runContext.startedAt;
   renderRunSummary();
+  updateStepStates();
 }
 
 async function openRunFolder() {
-  if (!state.runContext?.folderName) return;
+  if (!state.runContext?.folderPath || PREVIEW_MODE) return;
   try {
     await api('/api/open-folder', {
       method: 'POST',
-      body: JSON.stringify({ path: `captures/${state.runContext.folderName}` })
+      body: JSON.stringify({ path: state.runContext.folderPath })
     });
   } catch (error) {
     const details = describeApiError(error);
@@ -1726,14 +2119,14 @@ function renderRunSummary() {
     return;
   }
 
-  const { folderName, kind, finished } = state.runContext;
-  const { success, warning, failure, total, tables, durationMs } = state.runStats;
+  const { folderPath, kind, finished } = state.runContext;
+  const { success, warning, failure, cancelled, total, tables, durationMs } = state.runStats;
   const kindText = kind === 'batch' ? '批量运行' : '单表运行';
 
   if (badge) {
-    if (folderName) {
+    if (folderPath) {
       badge.classList.remove('is-hidden');
-      badge.textContent = folderName;
+      badge.textContent = folderPath;
     } else {
       badge.classList.add('is-hidden');
       badge.textContent = '';
@@ -1756,7 +2149,8 @@ function renderRunSummary() {
   tiles.append(
     buildRunTile('success', success, '成功'),
     buildRunTile('warning', warning, '告警'),
-    buildRunTile('failure', failure, '失败')
+    buildRunTile('failure', failure, '失败'),
+    buildRunTile('cancelled', cancelled, '取消')
   );
   summary.appendChild(tiles);
 
@@ -1765,8 +2159,9 @@ function renderRunSummary() {
   const openButton = document.createElement('button');
   openButton.type = 'button';
   openButton.className = 'button button-secondary run-open-folder';
-  openButton.textContent = folderName ? `📂 打开本次任务目录（${folderName}）` : '📂 打开本次任务目录';
-  openButton.disabled = !folderName;
+  openButton.textContent = folderPath ? `📂 打开服务端返回的任务目录` : '📂 暂无服务端输出目录';
+  openButton.title = folderPath || '';
+  openButton.disabled = !folderPath || PREVIEW_MODE;
   openButton.addEventListener('click', openRunFolder);
   actions.appendChild(openButton);
 
@@ -1777,16 +2172,18 @@ function renderRunSummary() {
   clearButton.addEventListener('click', () => {
     state.runContext = null;
     state.runEntries = [];
-    state.runStats = { success: 0, warning: 0, failure: 0, total: 0, durationMs: 0, tables: new Set() };
+    state.runEntriesByKind = { success: [], warning: [], failure: [], cancelled: [] };
+    state.runStats = { success: 0, warning: 0, failure: 0, cancelled: 0, total: 0, durationMs: 0, tables: new Set() };
     renderRunSummary();
     updateStepStates();
   });
   actions.appendChild(clearButton);
   summary.appendChild(actions);
 
-  const failureEntries = state.runEntries.filter((entry) => entry.kind === 'error');
-  const warningEntries = state.runEntries.filter((entry) => entry.kind === 'warning');
-  const successEntries = state.runEntries.filter((entry) => entry.kind === 'success');
+  const failureEntries = state.runEntriesByKind.failure;
+  const warningEntries = state.runEntriesByKind.warning;
+  const successEntries = state.runEntriesByKind.success;
+  const cancelledEntries = state.runEntriesByKind.cancelled;
 
   details.replaceChildren();
   if (!total) {
@@ -1800,6 +2197,9 @@ function renderRunSummary() {
   }
   if (warningEntries.length) {
     details.appendChild(buildRunDetailsGroup('warning', '告警明细', warningEntries, true));
+  }
+  if (cancelledEntries.length) {
+    details.appendChild(buildRunDetailsGroup('cancelled', '取消明细', cancelledEntries, true));
   }
   if (successEntries.length) {
     details.appendChild(buildRunDetailsGroup('success', '成功任务', successEntries, false));
@@ -1827,7 +2227,9 @@ function buildRunDetailsGroup(tone, label, entries, defaultOpen) {
 
   const list = document.createElement('ul');
   list.className = 'run-entry-list';
-  entries.forEach((entry) => {
+  const pageData = paginate(entries, state.runPages[tone] || 1, RUN_ENTRY_PAGE_SIZE);
+  state.runPages[tone] = pageData.page;
+  pageData.items.forEach((entry) => {
     const item = document.createElement('li');
     item.className = `run-entry run-entry-${tone}`;
     const top = document.createElement('div');
@@ -1872,6 +2274,12 @@ function buildRunDetailsGroup(tone, label, entries, defaultOpen) {
   });
 
   group.appendChild(list);
+  if (pageData.pageCount > 1) {
+    group.appendChild(buildPagination(pageData, (page) => {
+      state.runPages[tone] = page;
+      renderRunSummary();
+    }, label));
+  }
   return group;
 }
 async function refreshStatus() {
@@ -1889,13 +2297,25 @@ async function refreshStatus() {
 }
 
 async function loadDatabases() {
-  const payload = await retryRequest(() => api('/api/databases', { method: 'GET' }), 2, 300);
-  state.databases = payload.databases;
-  renderDatabaseOptions();
-  if (state.databases.length) {
-    state.currentDatabase = state.databases[0];
-    elements.databaseSelect.value = state.currentDatabase;
-    await loadTables();
+  const request = selectionRequests.begin('databases');
+  try {
+    const payload = await retryRequest(
+      () => api('/api/databases', { method: 'GET', signal: request.signal }),
+      2,
+      300
+    );
+    if (!request.isCurrent()) return;
+    state.databases = Array.isArray(payload.databases) ? payload.databases : [];
+    renderDatabaseOptions();
+    if (state.databases.length) {
+      state.currentDatabase = state.databases[0];
+      elements.databaseSelect.value = state.currentDatabase;
+      await loadTables();
+    }
+  } catch (error) {
+    if (!isAbortError(error) && request.isCurrent()) throw error;
+  } finally {
+    request.finish();
   }
 }
 
@@ -1903,6 +2323,8 @@ function resetQueryViews() {
   state.columns = [];
   state.preview = { columns: [], rows: [] };
   state.result = { columns: [], rows: [] };
+  state.previewPage = 1;
+  state.resultPage = 1;
   renderColumns();
   renderPreview();
   renderResult();
@@ -1911,12 +2333,15 @@ function resetQueryViews() {
 async function loadTables() {
   const database = elements.databaseSelect.value;
   const previousDatabase = state.currentDatabase;
-  if (state.batchRunning && database !== previousDatabase) {
+  if ((state.batchRunning || singleRunLock.locked) && database !== previousDatabase) {
     elements.databaseSelect.value = previousDatabase;
     setStatus('批量执行中，暂不支持切换数据库。', 'error');
     return;
   }
   if (!database) {
+    selectionRequests.abort('tables');
+    selectionRequests.abort('table-details');
+    selectionRequests.abort('template-preview');
     if (previousDatabase && previousDatabase !== database) {
       clearTaskQueue({ silent: true, source: 'database-switch' });
     }
@@ -1931,12 +2356,17 @@ async function loadTables() {
     updateSqlPreview();
     return;
   }
+  const request = selectionRequests.begin('tables');
+  selectionRequests.abort('table-details');
+  selectionRequests.abort('template-preview');
+  selectionRequests.abort('copy-sql');
   const switchingDatabase = Boolean(previousDatabase) && previousDatabase !== database;
   const clearedTasks = switchingDatabase
     ? clearTaskQueue({ silent: true, source: 'database-switch' })
     : 0;
   state.currentDatabase = database;
   state.currentTable = '';
+  state.lastServerSql = null;
   state.selectedTables.clear();
   updateCurrentTableLabel();
   resetQueryViews();
@@ -1944,20 +2374,34 @@ async function loadTables() {
   if (clearedTasks) {
     setStatus(`已切换到 ${database}，并清空上一数据库的 ${clearedTasks} 个任务，正在读取库表列表...`, 'working');
   }
-  const payload = await retryRequest(
-    () => api(`/api/tables?database=${encodeURIComponent(database)}`, { method: 'GET' }),
-    2,
-    300
-  );
-  state.tables = payload.tables;
-  renderTableSelects();
-  updateStepStates();
-  updateSqlPreview();
-  setStatus(`已载入 ${database} 的 ${state.tables.length} 张表。`, 'success');
+  try {
+    const payload = await retryRequest(
+      () => api(`/api/tables?database=${encodeURIComponent(database)}`, { method: 'GET', signal: request.signal }),
+      2,
+      300
+    );
+    if (!request.isCurrent() || state.currentDatabase !== database) return;
+    state.tables = Array.isArray(payload.tables) ? payload.tables : [];
+    renderTableSelects();
+    updateStepStates();
+    updateSqlPreview();
+    setStatus(`已载入 ${database} 的 ${state.tables.length} 张表。`, 'success');
+  } catch (error) {
+    if (!isAbortError(error) && request.isCurrent()) throw error;
+  } finally {
+    request.finish();
+  }
 }
 
 async function selectTable(tableName) {
+  if (state.batchRunning || singleRunLock.locked) {
+    elements.tableSelect.value = state.currentTable;
+    setStatus('任务执行中，暂不支持切换试跑表。', 'error');
+    return;
+  }
   if (!tableName) {
+    selectionRequests.abort('table-details');
+    selectionRequests.abort('template-preview');
     state.currentTable = '';
     updateCurrentTableLabel();
     resetQueryViews();
@@ -1965,55 +2409,97 @@ async function selectTable(tableName) {
     updateSqlPreview();
     return;
   }
+  if (PREVIEW_MODE) {
+    applyPreviewTableSelection(tableName);
+    return;
+  }
+  const request = selectionRequests.begin('table-details');
+  selectionRequests.abort('template-preview');
+  const database = state.currentDatabase;
   state.currentTable = tableName;
+  state.lastServerSql = null;
+  state.previewPage = 1;
   updateCurrentTableLabel();
   updateSqlPreview();
   setStatus(`正在读取 ${tableName} 的结构和预览数据...`, 'working');
   try {
     const [columnsPayload, previewPayload] = await Promise.all([
-      api(`/api/columns?database=${encodeURIComponent(state.currentDatabase)}&table=${encodeURIComponent(tableName)}`, { method: 'GET' }),
-      api(`/api/preview?database=${encodeURIComponent(state.currentDatabase)}&table=${encodeURIComponent(tableName)}&limit=${encodeURIComponent(elements.previewLimitInput.value)}`, { method: 'GET' })
+      api(`/api/columns?database=${encodeURIComponent(database)}&table=${encodeURIComponent(tableName)}`, { method: 'GET', signal: request.signal }),
+      api(`/api/preview?database=${encodeURIComponent(database)}&table=${encodeURIComponent(tableName)}&limit=${encodeURIComponent(elements.previewLimitInput.value)}`, { method: 'GET', signal: request.signal })
     ]);
-    state.columns = columnsPayload.columns;
-    state.preview = previewPayload.result;
+    if (!request.isCurrent() || state.currentDatabase !== database || state.currentTable !== tableName) return;
+    state.columns = Array.isArray(columnsPayload.columns) ? columnsPayload.columns : [];
+    state.preview = previewPayload.result || { columns: [], rows: [] };
     renderColumns();
     renderPreview();
     renderTasks();
     updateStepStates();
+    updateSqlPreview();
     setStatus(`已加载 ${tableName} 的字段结构和预览数据。`, 'success');
   } catch (error) {
-    setStatus(error.message, 'error');
+    if (!isAbortError(error) && request.isCurrent()) {
+      setStatus(error.message, 'error');
+    }
+  } finally {
+    request.finish();
   }
 }
 
 async function runQuery(capture) {
+  if (PREVIEW_MODE) {
+    setStatus('预览模式只展示本地示例，不会执行数据库查询或截图。', 'error');
+    return;
+  }
+  if (!state.templatesReady) {
+    setStatus('服务端模板元数据尚未就绪，查询已停用。', 'error');
+    return;
+  }
+  if (state.batchRunning) {
+    setStatus('批量任务执行中，请等待结束后再运行单表任务。', 'error');
+    return;
+  }
+  const releaseLock = singleRunLock.tryAcquire();
+  if (!releaseLock) {
+    setStatus('单表任务已经在执行，请勿重复提交。', 'error');
+    return;
+  }
   const tableInfo = getTableInfo();
   const template = getTemplateById(state.currentTemplateId);
   if (!state.currentDatabase || !tableInfo) {
+    releaseLock();
     setStatus('请先选择数据库和表。', 'error');
     return;
   }
-  const sql = buildTemplateSql(state.currentTemplateId, state.currentDatabase, tableInfo.tableName, tableInfo.tableComment || '');
-  if (sql.startsWith('--')) {
-    setStatus(sql.slice(3).trim() || '当前模板缺少可用字段，无法执行。', 'error');
+  const fieldState = getTemplateFieldState(state.currentTemplateId, tableInfo.tableName);
+  if (fieldState && !fieldState.activeField) {
+    releaseLock();
+    setStatus(`请先选择${fieldState.label}。`, 'error');
     return;
   }
-  updateSqlPreview();
+  const database = state.currentDatabase;
+  const tableName = tableInfo.tableName;
+  const templateId = state.currentTemplateId;
+  const fields = getQueryFields(templateId, tableName);
   setStatus(capture ? '正在执行查询并生成截图...' : '正在执行查询...', 'working');
   const startedAt = performance.now();
   const singleRunFolderName = elements.taskNameInput.value.trim() || '单表试跑';
   if (capture) {
     beginRun({ folderName: singleRunFolderName, kind: 'single' });
   }
+  const runId = state.runContext?.runId || createRunId();
+  syncInteractionLocks();
   try {
-    if (state.currentTemplateId === 'storage-usage') {
+    const analyzeConfirmed = templateRequiresAnalyze(templateId)
+      && window.confirm('是否在查询前刷新该表的存储统计？确认后会执行 ANALYZE TABLE；选择“取消”将直接读取现有统计。');
+    if (analyzeConfirmed) {
       setStatus('正在刷新统计信息以确保存储空间为最新值...', 'working');
       try {
         await api('/api/analyze-table', {
           method: 'POST',
           body: JSON.stringify({
-            database: state.currentDatabase,
-            table: tableInfo.tableName
+            database,
+            table: tableName,
+            confirm: true
           })
         });
       } catch (analyzeError) {
@@ -2038,45 +2524,60 @@ async function runQuery(capture) {
     }
     const payload = await api('/api/query', {
       method: 'POST',
-      body: JSON.stringify({
-        database: state.currentDatabase,
-        table: tableInfo.tableName,
-        tableComment: tableInfo.tableComment || '',
-        sql,
+      body: JSON.stringify(buildQueryRequest({
+        database,
+        table: tableName,
+        templateId,
+        fields,
         capture,
         taskName: singleRunFolderName,
-        imageName: template.name,
-        templateId: state.currentTemplateId,
-        captureProfileKey: capture ? 'single-run-preview' : '',
-        captureOptions: {
-          hideSql: state.currentTemplateId === 'table-structure',
-          showTableMeta: state.currentTemplateId === 'table-structure'
-        }
-      })
+        runId,
+        captureProfileKey: capture ? 'single-run-preview' : ''
+      }))
     });
-    state.result = payload.result;
+    state.result = payload.result || { columns: [], rows: [] };
+    state.resultPage = 1;
     renderResult();
     updateStepStates();
-    if (payload.artifact) {
+    const sql = String(payload.sql || '').trim();
+    if (sql) {
+      const key = getQueryPreviewKey(database, tableName, templateId, fields);
+      state.lastServerSql = { key, sql };
+      if (state.currentDatabase === database && state.currentTable === tableName && state.currentTemplateId === templateId) {
+        elements.sqlEditor.value = sql;
+      }
+    }
+    if (capture) {
+      const artifact = requireCaptureArtifact(payload);
+      const completeness = describeCaptureCompleteness(artifact);
       appendRunEntry({
         kind: 'success',
-        title: `${singleRunFolderName} / ${tableInfo.tableName} / ${template.name}`,
-        tableName: tableInfo.tableName,
+        title: `${singleRunFolderName} / ${tableName} / ${template.name}`,
+        tableName,
         templateName: template.name,
-        imagePath: payload.artifact.imagePath,
+        imagePath: artifact.imagePath,
+        folderPath: artifact.folderPath,
+        message: completeness.summary,
         durationMs: performance.now() - startedAt
       });
+      appendArtifactCompletenessWarning(artifact, {
+        title: `${singleRunFolderName} / ${tableName} / ${template.name}`,
+        tableName,
+        templateName: template.name
+      });
+      setStatus(`查询完成，已保存截图到 ${artifact.imagePath}`, 'success');
+    } else {
+      setStatus(describeQueryCompleteness(state.result).summary, 'success');
     }
-    setStatus(capture ? `查询完成，已保存截图到 ${payload.artifact.imagePath}` : `查询完成，返回 ${payload.result.rows.length} 行。`, 'success');
   } catch (error) {
     if (capture) {
       const details = describeApiError(error);
       appendRunEntry({
         kind: 'error',
-        title: `${singleRunFolderName} / ${tableInfo.tableName} / ${template.name}`,
-        tableName: tableInfo.tableName,
+        title: `${singleRunFolderName} / ${tableName} / ${template.name}`,
+        tableName,
         templateName: template.name,
-        reason: details.reason,
+        reason: details.reason || details.message,
         logPath: details.logPath,
         message: details.message,
         durationMs: performance.now() - startedAt
@@ -2087,10 +2588,16 @@ async function runQuery(capture) {
     if (capture) {
       finalizeRun();
     }
+    releaseLock();
+    syncInteractionLocks();
   }
 }
 
 function saveCurrentTask() {
+  if (!state.templatesReady || PREVIEW_MODE) {
+    setStatus('模板元数据尚未就绪，无法生成任务。', 'error');
+    return;
+  }
   const folderName = elements.taskNameInput.value.trim();
   if (!folderName) {
     setStatus('请先填写任务模板文件夹名。', 'error');
@@ -2106,6 +2613,10 @@ function saveCurrentTask() {
   let reusedCount = 0;
   let skippedCount = 0;
   const skippedIssues = [];
+  const taskKey = (taskFolder, tableName, templateId) => JSON.stringify([taskFolder, tableName, templateId]);
+  const tasksByKey = new Map(
+    state.tasks.map((task) => [taskKey(task.folderName, task.tableName, task.templateId), task])
+  );
 
   selectedTables.forEach((tableInfo) => {
     QUERY_TEMPLATES.forEach((template) => {
@@ -2119,9 +2630,8 @@ function saveCurrentTask() {
         return;
       }
 
-      const existing = state.tasks.find(
-        (task) => task.folderName === folderName && task.tableName === tableInfo.tableName && task.templateId === template.id
-      );
+      const key = taskKey(folderName, tableInfo.tableName, template.id);
+      const existing = tasksByKey.get(key);
 
       if (existing) {
         existing.enabled = true;
@@ -2129,13 +2639,15 @@ function saveCurrentTask() {
         return;
       }
 
-      state.tasks.unshift({
+      const newTask = {
         id: crypto.randomUUID(),
         folderName,
         tableName: tableInfo.tableName,
         templateId: template.id,
         enabled: true
-      });
+      };
+      state.tasks.unshift(newTask);
+      tasksByKey.set(key, newTask);
       createdCount += 1;
     });
   });
@@ -2162,6 +2674,7 @@ function saveCurrentTask() {
 }
 
 async function prewarmCaptureSessions(taskCount = 0) {
+  if (PREVIEW_MODE) return;
   const workerCount = getBatchConcurrency(taskCount);
   const keys = ['single-run-preview'];
   for (let i = 0; i < workerCount; i++) {
@@ -2174,14 +2687,61 @@ async function prewarmCaptureSessions(taskCount = 0) {
 }
 
 function hydrateDrafts() {
-  const savedTemplateId = localStorage.getItem(STORAGE_KEYS.templateId);
+  let preferences = {};
   try {
-    state.fieldOverrides = JSON.parse(localStorage.getItem(STORAGE_KEYS.fieldOverrides) || '{}') || {};
+    preferences = JSON.parse(localStorage.getItem(STORAGE_KEYS.preferences) || '{}') || {};
+    if (!Object.keys(preferences).length) {
+      preferences = {
+        templateId: localStorage.getItem('mysql-capture-template-id') || '',
+        fieldOverrides: JSON.parse(localStorage.getItem('mysql-capture-field-overrides') || '{}') || {}
+      };
+    }
   } catch {
-    state.fieldOverrides = {};
+    preferences = {};
   }
-  state.currentTemplateId = QUERY_TEMPLATES.some((item) => item.id === savedTemplateId) ? savedTemplateId : QUERY_TEMPLATES[0].id;
+  try {
+    LEGACY_STORAGE_KEYS.forEach((key) => localStorage.removeItem(key));
+  } catch {
+    // Legacy cleanup is best effort only.
+  }
+  state.fieldOverrides = preferences.fieldOverrides && typeof preferences.fieldOverrides === 'object'
+    ? preferences.fieldOverrides
+    : {};
+  state.currentTemplateId = typeof preferences.templateId === 'string' ? preferences.templateId : '';
+  persistPreferences();
   updateSqlPreview();
+}
+
+function getModalFocusableNodes() {
+  if (!elements.batchConfirmModal || elements.batchConfirmModal.classList.contains('is-hidden')) return [];
+  return [...elements.batchConfirmModal.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
+  )].filter((node) => !node.hidden && node.getClientRects().length > 0);
+}
+
+function handleModalKeydown(event) {
+  if (!elements.batchConfirmModal || elements.batchConfirmModal.classList.contains('is-hidden')) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeBatchModal();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = getModalFocusableNodes();
+  if (!focusable.length) {
+    event.preventDefault();
+    elements.batchConfirmModal.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function bindEvents() {
@@ -2213,7 +2773,9 @@ function bindEvents() {
   elements.runTasksButton.addEventListener('click', openBatchModal);
   elements.batchModalCloseButton.addEventListener('click', () => closeBatchModal());
   elements.batchModalCancelButton.addEventListener('click', () => closeBatchModal());
-  elements.batchModalConfirmButton.addEventListener('click', () => executeBatchRun());
+  elements.batchModalConfirmButton.addEventListener('click', () => {
+    executeBatchRun().catch((error) => setStatus(error.message, 'error'));
+  });
   if (elements.batchModalStopButton) {
     elements.batchModalStopButton.addEventListener('click', () => requestBatchCancellation());
   }
@@ -2224,24 +2786,27 @@ function bindEvents() {
     elements.batchProgressDockStopButton.addEventListener('click', () => requestBatchCancellation());
   }
   window.addEventListener('beforeunload', (event) => {
-    if (!hasResettablePageState()) {
+    if (PREVIEW_MODE || !hasResettablePageState()) {
       return;
     }
     event.preventDefault();
     event.returnValue = '';
   });
+  document.addEventListener('keydown', handleModalKeydown);
   document.querySelectorAll('.progress-item[data-target]').forEach((item) => {
     item.addEventListener('click', () => {
       const targetId = item.dataset.target;
       const target = document.getElementById(targetId);
       if (target) {
-        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        target.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
       }
     });
   });
 }
 
 function reveal() {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   document.querySelectorAll('.reveal').forEach((node, index) => {
     node.style.animationDelay = `${index * 90}ms`;
   });
@@ -2253,6 +2818,56 @@ function applyRuntimeCopy() {
   if (workspaceSubtitle) {
     workspaceSubtitle.textContent = '模板查询·字段识别·抽检预览·批量截图·结果留档';
   }
+}
+
+function applyPreviewTableSelection(tableName) {
+  const tableInfo = getTableInfo(tableName);
+  if (!tableInfo) return;
+  const timeField = tableInfo.detectedFields?.timeField || 'record_time';
+  const regionField = tableInfo.detectedFields?.regionField || 'region_name';
+  state.currentTable = tableName;
+  state.columns = [
+    { ordinalPosition: 1, columnName: 'id', columnType: 'bigint', isNullable: 'NO', columnDefault: null, columnComment: '主键' },
+    { ordinalPosition: 2, columnName: timeField, columnType: 'datetime', isNullable: 'NO', columnDefault: null, columnComment: '记录时间' },
+    { ordinalPosition: 3, columnName: regionField, columnType: 'varchar(64)', isNullable: 'YES', columnDefault: null, columnComment: '区域名称' }
+  ];
+  state.preview = {
+    columns: [timeField, regionField, 'sample_value'],
+    rows: [
+      { [timeField]: '2026-07-10 08:00:00', [regionField]: '示例区域 A', sample_value: 42 },
+      { [timeField]: '2026-07-10 09:00:00', [regionField]: '示例区域 B', sample_value: 37 }
+    ]
+  };
+  state.previewPage = 1;
+  state.lastServerSql = null;
+  elements.tableSelect.value = tableName;
+  updateCurrentTableLabel();
+  renderColumns();
+  renderPreview();
+  renderTasks();
+  updateSqlPreview();
+  updateStepStates();
+  setStatus(`预览模式：已切换本地示例表 ${tableName}，未访问 API。`, 'success');
+}
+
+function disablePreviewProductionActions() {
+  document.body.classList.add('is-preview-mode');
+  syncInteractionLocks();
+  [
+    elements.runQueryButton,
+    elements.runAndCaptureButton,
+    elements.saveTaskButton,
+    elements.runTasksButton,
+    elements.copySelectedSqlButton,
+    elements.clearTasksButton,
+    elements.refreshTablesButton,
+    elements.selectAllTablesButton,
+    elements.clearSelectedTablesButton
+  ].forEach((button) => {
+    if (!button) return;
+    button.disabled = true;
+    button.title = '预览模式不会执行生产操作或访问真实 API';
+  });
 }
 
 function initPreviewMode() {
@@ -2332,6 +2947,7 @@ function initPreviewMode() {
     tableName: 'scjy_zhyq_daily_operation',
     templateName: '查询表结构',
     imagePath: 'captures/demo/scjy_zhyq_daily_operation/查询表结构.png',
+    folderPath: 'captures/demo',
     durationMs: 1860
   });
   finalizeRun();
@@ -2341,6 +2957,7 @@ function initPreviewMode() {
   if (elements.toastMessage) {
     elements.toastMessage.classList.remove('is-visible');
   }
+  disablePreviewProductionActions();
 }
 
 async function init() {
@@ -2359,12 +2976,16 @@ async function init() {
   syncBatchProgressDock();
   updateStepStates();
   if (PREVIEW_MODE) {
+    await loadTemplateMetadata();
     initPreviewMode();
     return;
   }
   try {
     const ready = await refreshStatus();
     if (!ready) return;
+    await loadTemplateMetadata();
+    renderQueryTemplates();
+    updateSqlPreview();
     await loadDatabases();
   } catch (error) {
     setStatus(error.message, 'error');

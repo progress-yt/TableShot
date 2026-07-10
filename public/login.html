@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MySQL 登录</title>
-  <link rel="stylesheet" href="/login.css?v=20260421a">
+  <link rel="stylesheet" href="/login.css?v=20260710a">
 </head>
 <body class="login-page">
   <div class="login-noise"></div>
@@ -54,10 +54,10 @@
           <p class="login-eyebrow">Database Login</p>
           <h2>连接你的 MySQL</h2>
         </div>
-        <span id="browserStatusBadge" class="login-badge">截图引擎检测中</span>
+        <span id="browserStatusBadge" class="login-badge" role="status" aria-live="polite">截图引擎检测中</span>
       </div>
 
-      <p class="login-note">连接成功后会自动进入工作台页面。</p>
+      <p class="login-note">连接成功后会自动进入工作台页面。请使用仅具备所需 SELECT 权限的专用账号；手动刷新存储统计时才需要额外的 ANALYZE 权限。</p>
 
       <div id="existingConnection" class="existing-connection is-hidden">
         <p>当前已有连接</p>
@@ -76,19 +76,19 @@
         </label>
         <label>
           <span>User</span>
-          <input id="userInput" name="user" placeholder="root" required>
+          <input id="userInput" name="user" placeholder="readonly_user" required autocomplete="username">
         </label>
         <label>
           <span>Password</span>
-          <input id="passwordInput" name="password" type="password" placeholder="输入数据库密码" required>
+          <input id="passwordInput" name="password" type="password" placeholder="输入数据库密码（可为空）" autocomplete="current-password">
         </label>
-        <button class="login-button login-button-primary" type="submit">连接并进入工作台</button>
+        <button id="connectButton" class="login-button login-button-primary" type="submit">连接并进入工作台</button>
       </form>
 
-      <p id="formMessage" class="form-message">准备就绪。</p>
+      <p id="formMessage" class="form-message" role="status" aria-live="polite" aria-atomic="true">准备就绪。</p>
     </section>
   </main>
 
-  <script src="/login.js?v=20260421a" defer></script>
+  <script src="/login.js?v=20260710a" defer></script>
 </body>
 </html>
